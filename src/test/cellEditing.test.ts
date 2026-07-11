@@ -2,14 +2,20 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import initSqlJs = require('sql.js');
 import { DatabaseService, EditableTableData, RowIdentity } from '../databaseService';
-
-const BetterSqlite3: any = require('better-sqlite3');
 
 suite('Stable cell editing', () => {
     let tempDir: string;
     let databasePath: string;
     let service: DatabaseService;
+    let SQL: initSqlJs.SqlJsStatic;
+
+    suiteSetup(async () => {
+        SQL = await initSqlJs({
+            locateFile: file => path.join(__dirname, '..', '..', 'node_modules', 'sql.js', 'dist', file)
+        });
+    });
 
     setup(() => {
         tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-intelliview-cell-edit-'));
@@ -23,16 +29,23 @@ suite('Stable cell editing', () => {
     });
 
     function createDatabase(sql: string): void {
-        const db = new BetterSqlite3(databasePath);
+        const db = new SQL.Database();
         db.exec(sql);
+        fs.writeFileSync(databasePath, Buffer.from(db.export()));
         db.close();
     }
 
     function readRows<T = Record<string, unknown>>(sql: string): T[] {
-        const db = new BetterSqlite3(databasePath, { readonly: true });
+        const db = new SQL.Database(fs.readFileSync(databasePath));
+        const statement = db.prepare(sql);
+        const rows: T[] = [];
         try {
-            return db.prepare(sql).all() as T[];
+            while (statement.step()) {
+                rows.push(statement.getAsObject() as unknown as T);
+            }
+            return rows;
         } finally {
+            statement.free();
             db.close();
         }
     }
@@ -64,11 +77,18 @@ suite('Stable cell editing', () => {
                 ('g', 1, 1, 'one');
         `);
 
-        const disk = new BetterSqlite3(databasePath);
+        const disk = new SQL.Database(fs.readFileSync(databasePath));
+        const rowidStatement = disk.prepare('SELECT rowid FROM records LIMIT 1 OFFSET ?');
+        const idStatement = disk.prepare('SELECT Id FROM records WHERE rowid = ?');
         const oldOffsetTargets = [1, 5].map(offset => {
-            const rowid = disk.prepare('SELECT rowid FROM records LIMIT 1 OFFSET ?').get(offset).rowid;
-            return disk.prepare('SELECT Id FROM records WHERE rowid = ?').get(rowid).Id;
+            const rowid = rowidStatement.get([offset])[0];
+            rowidStatement.reset();
+            const id = idStatement.get([rowid])[0];
+            idStatement.reset();
+            return id;
         });
+        rowidStatement.free();
+        idStatement.free();
         disk.close();
         assert.deepStrictEqual(oldOffsetTargets, [5, 40]);
 
