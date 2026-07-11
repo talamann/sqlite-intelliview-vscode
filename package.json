@@ -94,13 +94,22 @@
         "displayName": "SQLite Database IntelliView",
         "selector": [
           {
-            "filenamePattern": "*.db"
+            "filenamePattern": "*.[dD][bB]"
           },
           {
-            "filenamePattern": "*.sqlite"
+            "filenamePattern": "*.[dD][bB]3"
           },
           {
-            "filenamePattern": "*.sqlite3"
+            "filenamePattern": "*.[sS]3[dD][bB]"
+          },
+          {
+            "filenamePattern": "*.[sS][lL]3"
+          },
+          {
+            "filenamePattern": "*.[sS][qQ][lL][iI][tT][eE]"
+          },
+          {
+            "filenamePattern": "*.[sS][qQ][lL][iI][tT][eE]3"
           }
         ],
         "priority": "default"
@@ -120,7 +129,7 @@
       "explorer/context": [
         {
           "command": "sqlite-intelliview-vscode.openDatabase",
-          "when": "resourceExtname == .db || resourceExtname == .sqlite || resourceExtname == .sqlite3",
+          "when": "resourceExtname =~ /\\.(db3?|sqlite3?|s3db|sl3)$/i",
           "group": "1_open"
         }
       ],
@@ -159,6 +168,15 @@
     "configuration": {
       "title": "SQLite IntelliView",
       "properties": {
+        "sqliteIntelliView.additionalFileExtensions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "markdownDescription": "Additional filename extensions to recognize as SQLite databases. Values may include a leading dot and are matched case-insensitively, for example `.database` or `sqlite-backup`. Invalid and duplicate values are ignored."
+        },
         "sqliteIntelliView.defaultPageSize": {
           "type": "number",
           "default": 1000,
@@ -241,5 +259,6 @@
     "sortablejs": "^1.15.6",
     "sql.js": "^1.13.0",
     "sqlite3": "^5.1.7"
-  }
+  },
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
 }

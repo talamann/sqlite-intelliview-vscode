@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import * as fs from 'fs';
 import { getWalFilePaths } from './walUtils';
 
 /**
@@ -58,7 +57,7 @@ export class DatabaseWatcher {
         const filterEvent = (uri: vscode.Uri) => {
             if (uri.fsPath === filePath) {
                 // For main database file, check if it's an internal update
-                if (filePath.endsWith('.db') || filePath.endsWith('.sqlite') || filePath.endsWith('.sqlite3')) {
+                if (filePath === debounceKey) {
                     if (isInternalUpdate(filePath)) {
                         // Suppress this event, it was triggered by our own write
                         return;
