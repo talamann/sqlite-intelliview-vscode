@@ -1351,6 +1351,9 @@ function handleTableData(message) {
         message.totalRows !== undefined,
       backendPaginated: true,
       foreignKeys: message.foreignKeys,
+      rowIdentities: message.rowIdentities,
+      allowEditing: message.editable === true,
+      editError: message.editError,
     });
   } else {
     if (typeof showError !== "undefined") {
@@ -2895,12 +2898,28 @@ function saveCellEdit(cell) {
 
   // Get cell metadata
   const tableName = getCurrentTableName();
-  const rowIndex = parseInt(cell.getAttribute("data-row-index"));
   const columnName = cell.getAttribute("data-column-name");
+  const row = cell.closest("tr[data-local-index]");
+  const wrapper = cell.closest(".enhanced-table-wrapper");
+  const tableId = wrapper?.getAttribute("data-table-id") || "";
+  const localIndex = parseInt(row?.getAttribute("data-local-index") || "", 10);
+  const tableStash = /** @type {any} */ (window).__tableDataStash;
+  const stashedTable = tableId && tableStash instanceof Map ? tableStash.get(tableId) : null;
+  const rowIdentity =
+    stashedTable &&
+    Array.isArray(stashedTable.rowIdentities) &&
+    Number.isInteger(localIndex)
+      ? stashedTable.rowIdentities[localIndex]
+      : null;
 
-  if (!tableName || isNaN(rowIndex) || !columnName) {
+  if (!tableName || !columnName || !rowIdentity) {
     if (window.debug) {
-      window.debug.error("Missing cell metadata for update");
+      window.debug.error("Missing stable row identity for update");
+    }
+    if (typeof showError !== "undefined") {
+      showError(
+        "This row cannot be identified safely. Refresh the table before editing."
+      );
     }
     cancelCellEdit(cell);
     return;
@@ -2909,6 +2928,19 @@ function saveCellEdit(cell) {
   // Show saving state
   cell.classList.add("saving");
   cell.classList.remove("error");
+  const win = /** @type {any} */ (window);
+  win.__cellEditSequence = Number(win.__cellEditSequence || 0) + 1;
+  const requestId = `cell-edit-${Date.now()}-${win.__cellEditSequence}`;
+  cell.setAttribute("data-edit-request-id", requestId);
+  if (!(win.__pendingCellEdits instanceof Map)) {
+    win.__pendingCellEdits = new Map();
+  }
+  win.__pendingCellEdits.set(requestId, {
+    cell,
+    tableId,
+    localIndex,
+    columnIndex: parseInt(cell.getAttribute("data-column") || "", 10),
+  });
 
   // Send update request to backend
   if (window.vscode && typeof window.vscode.postMessage === "function") {
@@ -2916,7 +2948,8 @@ function saveCellEdit(cell) {
     window.vscode.postMessage({
       type: "updateCellData",
       tableName: tableName,
-      rowIndex: rowIndex,
+      requestId: requestId,
+      rowIdentity: rowIdentity,
       columnName: columnName,
       newValue: newValue,
       key: currentState.encryptionKey,
@@ -2929,6 +2962,30 @@ function saveCellEdit(cell) {
   }
 }
 
+function findPendingEditCell(requestId) {
+  if (!requestId) {
+    return null;
+  }
+  return Array.from(
+    document.querySelectorAll(".data-cell[data-edit-request-id]")
+  ).find(
+    (candidate) =>
+      candidate.getAttribute("data-edit-request-id") === requestId
+  );
+}
+
+function takePendingCellEdit(requestId) {
+  const win = /** @type {any} */ (window);
+  const pending =
+    win.__pendingCellEdits instanceof Map
+      ? win.__pendingCellEdits.get(requestId)
+      : null;
+  if (win.__pendingCellEdits instanceof Map) {
+    win.__pendingCellEdits.delete(requestId);
+  }
+  return pending || null;
+}
+
 /**
  * Cancel cell edit
  * @param {Element} cell - The cell element being edited
@@ -2938,7 +2995,13 @@ function cancelCellEdit(cell) {
     return;
   }
 
+  const requestId = cell.getAttribute("data-edit-request-id");
+  const win = /** @type {any} */ (window);
+  if (requestId && win.__pendingCellEdits instanceof Map) {
+    win.__pendingCellEdits.delete(requestId);
+  }
   cell.classList.remove("editing", "saving", "error");
+  cell.removeAttribute("data-edit-request-id");
   const input = cell.querySelector(".cell-input");
   if (input) {
     /** @type {HTMLInputElement} */ (input).value = "";
@@ -2950,18 +3013,60 @@ function cancelCellEdit(cell) {
  * @param {Object} message - Success message from backend
  */
 function handleCellUpdateSuccess(message) {
-  const { tableName, rowIndex, columnName, newValue } = message;
+  const { requestId, newValue, rowIdentity } = message;
 
-  // Find the cell that was updated
-  const cell = document.querySelector(
-    `.data-cell[data-row-index="${rowIndex}"][data-column-name="${columnName}"]`
-  );
+  const pending = takePendingCellEdit(requestId);
+  const cell = pending?.cell || findPendingEditCell(requestId);
+  const tableId = pending?.tableId || cell?.closest(".enhanced-table-wrapper")?.getAttribute("data-table-id") || "";
+  const localIndex = Number.isInteger(pending?.localIndex)
+    ? pending.localIndex
+    : parseInt(
+        cell?.closest("tr[data-local-index]")?.getAttribute("data-local-index") || "",
+        10
+      );
+  const columnIndex = Number.isInteger(pending?.columnIndex)
+    ? pending.columnIndex
+    : parseInt(cell?.getAttribute("data-column") || "", 10);
+  const wrapper = Array.from(
+    document.querySelectorAll(".enhanced-table-wrapper[data-table-id]")
+  ).find(candidate => candidate.getAttribute("data-table-id") === tableId);
+  const tableStash = /** @type {any} */ (window).__tableDataStash;
+  const stashedTable =
+    tableId && tableStash instanceof Map ? tableStash.get(tableId) : null;
+  if (
+    rowIdentity &&
+    stashedTable &&
+    Array.isArray(stashedTable.rowIdentities) &&
+    Number.isInteger(localIndex)
+  ) {
+    stashedTable.rowIdentities[localIndex] = rowIdentity;
+  }
+  if (
+    stashedTable &&
+    Array.isArray(stashedTable.pageData) &&
+    Array.isArray(stashedTable.pageData[localIndex]) &&
+    Number.isInteger(columnIndex)
+  ) {
+    stashedTable.pageData[localIndex][columnIndex] = newValue;
+  }
+  const virtualState = /** @type {any} */ (wrapper)?.__virtualTableState;
+  if (
+    virtualState &&
+    Array.isArray(virtualState.pageData) &&
+    Array.isArray(virtualState.pageData[localIndex]) &&
+    Number.isInteger(columnIndex)
+  ) {
+    virtualState.pageData[localIndex][columnIndex] = newValue;
+  }
 
-  if (cell) {
+  if (cell && cell.isConnected) {
     // Update the cell content
     const cellContent = cell.querySelector(".cell-content");
     if (cellContent) {
-      cellContent.setAttribute("data-original-value", newValue || "");
+      cellContent.setAttribute(
+        "data-original-value",
+        newValue === null || newValue === undefined ? "" : String(newValue)
+      );
 
       if (newValue === null || newValue === "") {
         cellContent.innerHTML = "<em>NULL</em>";
@@ -2972,12 +3077,21 @@ function handleCellUpdateSuccess(message) {
 
     // Remove editing state
     cell.classList.remove("editing", "saving", "error");
+    cell.removeAttribute("data-edit-request-id");
 
     // Show success feedback
     cell.style.backgroundColor = "var(--vscode-list-activeSelectionBackground)";
     setTimeout(() => {
       cell.style.backgroundColor = "";
     }, 1000);
+  }
+
+  if (
+    virtualState &&
+    wrapper &&
+    typeof window.refreshVirtualTable === "function"
+  ) {
+    window.refreshVirtualTable(wrapper);
   }
 
   if (typeof showSuccess !== "undefined") {
@@ -2990,16 +3104,16 @@ function handleCellUpdateSuccess(message) {
  * @param {Object} message - Error message from backend
  */
 function handleCellUpdateError(message) {
-  const { tableName, rowIndex, columnName } = message;
+  const { requestId } = message;
 
   // Find the cell that failed to update
-  const cell = document.querySelector(
-    `.data-cell[data-row-index="${rowIndex}"][data-column-name="${columnName}"]`
-  );
+  const pending = takePendingCellEdit(requestId);
+  const cell = pending?.cell || findPendingEditCell(requestId);
 
-  if (cell) {
+  if (cell && cell.isConnected) {
     cell.classList.remove("saving");
     cell.classList.add("error");
+    cell.removeAttribute("data-edit-request-id");
 
     // Keep editing mode active so user can retry
     setTimeout(() => {

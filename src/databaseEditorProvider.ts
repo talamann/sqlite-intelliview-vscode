@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { DatabaseService } from './databaseService';
+import { DatabaseService, RowIdentity } from './databaseService';
 import { DatabaseWatcher } from './databaseWatcher';
 import type { ExtensionToWebviewMessage, WebviewSettingsPayload } from './webviewMessages';
 import { isWebviewToExtensionMessage } from './webviewMessages';
@@ -236,7 +236,7 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                     this.handleTableDataRequest(webviewPanel, document.uri.fsPath, e.tableName, e.key, e.page, e.pageSize, true);
                     return;
                 case 'updateCellData':
-                    this.handleCellUpdateRequest(webviewPanel, document.uri.fsPath, e.tableName, e.rowIndex, e.columnName, e.newValue, e.key);
+                    this.handleCellUpdateRequest(webviewPanel, document.uri.fsPath, e.tableName, e.requestId, e.rowIdentity, e.columnName, e.newValue, e.key);
                     return;
                 case 'deleteRow':
                     this.debugLog('onDidReceiveMessage', 'Processing deleteRow message');
@@ -696,29 +696,15 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 });
             }
 
-            // Fix column headers: alias rowid as _rowid and remove duplicate id columns
-            let columns = result.columns;
-            let data = result.values;
-            // If first column is rowid and second is id, remove the second if they are identical for all rows
-            if (columns.length > 1 && columns[0].toLowerCase() === 'rowid' && columns[1].toLowerCase() === 'id') {
-                const allMatch = data.every(row => row[0] === row[1]);
-                if (allMatch) {
-                    // Remove the second column (id)
-                    columns = [columns[0], ...columns.slice(2)];
-                    data = data.map(row => [row[0], ...row.slice(2)]);
-                }
-            }
-            // Always alias rowid as _rowid for clarity
-            if (columns[0].toLowerCase() === 'rowid') {
-                columns = ['_rowid', ...columns.slice(1)];
-            }
-
             this.postWebviewMessage(webviewPanel.webview, {
                 type: 'tableData',
                 success: true,
                 tableName,
-                data: data,
-                columns: columns,
+                data: result.values,
+                columns: result.columns,
+                rowIdentities: result.rowIdentities,
+                editable: result.editable,
+                editError: result.editError,
                 foreignKeys: foreignKeys,
                 columnInfo: columnInfo,
                 page: page,
@@ -733,9 +719,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                     since: '',
                     page: page!,
                     pageSize: pageSize!,
-                    lastPageData: data // <--- store the actual rows
+                    lastPageData: result.values // <--- store the actual rows
                 });
-                this.debugLog('getTableDataPaginated', 'lastSync set for', databasePath, { table: tableName, page, pageSize, lastPageData: data });
+                this.debugLog('getTableDataPaginated', 'lastSync set for', databasePath, { table: tableName, page, pageSize, lastPageData: result.values });
             }
         } catch (error) {
             this.postWebviewMessage(webviewPanel.webview, {
@@ -745,20 +731,10 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
         }
     }
 
-    private async handleCellUpdateRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, rowIndex: number, columnName: string, newValue: any, key?: string) {
-        this.debugLog('handleCellUpdateRequest', `Processing cell update request:`, {
-            tableName, rowIndex, columnName, newValue,
-            databasePath: databasePath.substring(databasePath.lastIndexOf('/') + 1)
-        });
-
+    private async handleCellUpdateRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, requestId: string, rowIdentity: RowIdentity, columnName: string, newValue: any, key?: string) {
         try {
             const dbService = await this.getOrCreateConnection(databasePath, key);
-            // First, get the rowid for the row we want to update
-            this.debugLog('handleCellUpdateRequest', `Getting rowid for row index ${rowIndex}`);
-            const rowId = await dbService.getCellRowId(tableName, rowIndex);
-            // Update the cell data
-            this.debugLog('handleCellUpdateRequest', `Updating cell data with rowid ${rowId}`);
-            await dbService.updateCellData(tableName, rowId, columnName, newValue);
+            const updateResult = await dbService.updateCellData(tableName, rowIdentity, columnName, newValue);
 
             // Invalidate caches for this table so subsequent reads are fresh.
             this.invalidateCachesForTable(databasePath, tableName);
@@ -768,12 +744,25 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 type: 'cellUpdateSuccess',
                 success: true,
                 tableName: tableName,
-                rowIndex: rowIndex,
+                requestId,
                 columnName: columnName,
-                newValue: newValue
+                newValue: updateResult.value,
+                rowIdentity: updateResult.identity,
+                changes: updateResult.changes
             });
-            
-            this.debugLog('handleCellUpdateRequest', 'Cell update completed successfully');
+
+            const sync = this.lastSync.get(databasePath);
+            if (sync?.table === tableName) {
+                await this.handleTableDataRequest(
+                    webviewPanel,
+                    databasePath,
+                    tableName,
+                    key,
+                    sync.page,
+                    sync.pageSize,
+                    true
+                );
+            }
         } catch (error) {
             this.debugError('handleCellUpdateRequest', 'Cell update failed:', error);
             this.postWebviewMessage(webviewPanel.webview, {
@@ -781,7 +770,7 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 success: false,
                 message: `Failed to update cell: ${error}`,
                 tableName: tableName,
-                rowIndex: rowIndex,
+                requestId,
                 columnName: columnName
             });
         }
@@ -1113,66 +1102,34 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
             this.debugWarn('DatabaseChange', `[handleExternalDatabaseChange] No panel or sync found for ${databasePath}`, { panel, sync });
             return;
         }
-        const { table, page, pageSize, lastPageData } = sync;
+        const { table, page, pageSize } = sync;
         this.debugLog('DatabaseChange', '[handleExternalDatabaseChange] Using sync state', { table, page, pageSize });
         const db = await this.getOrCreateConnection(databasePath);
         const newResult = await db.getTableDataPaginated(table, page, pageSize);
         const newTotalCount = await db.getRowCount(table);
         this.rowCountCache.set(this.getTableCacheKey(databasePath, table), newTotalCount);
         this.debugLog('DatabaseChange', 'New page data fetched', { rowCount: newResult.values.length, newTotalCount });
-        const oldRows = lastPageData || [];
-        const newRows = newResult.values;
-        const baseIndex = (page - 1) * pageSize;
-        const oldMap = new Map();
-        oldRows.forEach((r, i) => oldMap.set(r[0], JSON.stringify(r)));
-        const newMap = new Map();
-        newRows.forEach((r, i) => newMap.set(r[0], JSON.stringify(r)));
-        const deletes: number[] = [];
-        for (const [rowid, _] of oldMap) {
-            if (!newMap.has(rowid)) {
-                const localIdx = oldRows.findIndex(r => r[0] === rowid);
-                deletes.push(baseIndex + localIdx);
-            }
-        }
-        const inserts: { rowIndex: number; rowData: any[] }[] = [];
-        newRows.forEach((r, i) => {
-            if (!oldMap.has(r[0])) {
-                inserts.push({ rowIndex: baseIndex + i, rowData: r });
-            }
-        });
-        const updates: { rowIndex: number; rowData: any[] }[] = [];
-        newRows.forEach((r, i) => {
-            const rowid = r[0], payload = JSON.stringify(r);
-            if (oldMap.has(rowid) && oldMap.get(rowid) !== payload) {
-                updates.push({ rowIndex: baseIndex + i, rowData: r });
-            }
-        });
-        const hasDelta = inserts.length > 0 || updates.length > 0 || deletes.length > 0;
-        this.debugLog('DatabaseChange', 'Delta computed', {
-            inserts: inserts.length,
-            updates: updates.length,
-            deletes: deletes.length
-        });
-        if (hasDelta) {
-            this.debugLog('DatabaseChange', 'Old Rows', JSON.stringify(oldRows));
-            this.debugLog('DatabaseChange', 'New Rows', JSON.stringify(newRows));
-        }
+        const [foreignKeys, columnInfo] = await Promise.all([
+            db.getForeignKeys(table),
+            db.getTableInfo(table)
+        ]);
         this.postWebviewMessage(panel.webview, {
-            type: 'tableDataDelta',
+            type: 'tableData',
+            success: true,
             tableName: table,
-            inserts,
-            updates,
-            deletes,
-            totalCount: newTotalCount
+            data: newResult.values,
+            columns: newResult.columns,
+            rowIdentities: newResult.rowIdentities,
+            editable: newResult.editable,
+            editError: newResult.editError,
+            foreignKeys,
+            columnInfo,
+            page,
+            pageSize,
+            totalRows: newTotalCount,
+            totalRowsKnown: true
         });
-        this.debugLog('DatabaseChange', 'tableDataDelta sent to webview', {
-            table,
-            inserts: inserts.length,
-            updates: updates.length,
-            deletes: deletes.length,
-            totalCount: newTotalCount
-        });
-        sync.lastPageData = newRows;
+        sync.lastPageData = newResult.values;
         this.lastSync.set(databasePath, sync);
         this.debugLog('DatabaseChange', 'lastPageData updated in lastSync', {
             databasePath,

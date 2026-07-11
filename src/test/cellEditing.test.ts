@@ -1,0 +1,260 @@
+import * as assert from 'assert';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { DatabaseService, EditableTableData, RowIdentity } from '../databaseService';
+
+const BetterSqlite3: any = require('better-sqlite3');
+
+suite('Stable cell editing', () => {
+    let tempDir: string;
+    let databasePath: string;
+    let service: DatabaseService;
+
+    setup(() => {
+        tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-intelliview-cell-edit-'));
+        databasePath = path.join(tempDir, 'test.sqlite');
+        service = new DatabaseService();
+    });
+
+    teardown(() => {
+        service.closeDatabase();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    function createDatabase(sql: string): void {
+        const db = new BetterSqlite3(databasePath);
+        db.exec(sql);
+        db.close();
+    }
+
+    function readRows<T = Record<string, unknown>>(sql: string): T[] {
+        const db = new BetterSqlite3(databasePath, { readonly: true });
+        try {
+            return db.prepare(sql).all() as T[];
+        } finally {
+            db.close();
+        }
+    }
+
+    function identityFor(data: EditableTableData, column: string, value: unknown): RowIdentity {
+        const columnIndex = data.columns.indexOf(column);
+        const rowIndex = data.values.findIndex(row => row[columnIndex] === value);
+        assert.ok(rowIndex >= 0, `Expected a row whose ${column} is ${String(value)}`);
+        const identity = data.rowIdentities[rowIndex];
+        assert.ok(identity, 'Expected the row to have a stable identity');
+        return identity;
+    }
+
+    test('reproduces the reported Id 1 to 5 and Id 5 to 40 OFFSET mismatch', async () => {
+        createDatabase(`
+            CREATE TABLE records (
+                record_key TEXT PRIMARY KEY,
+                Id INTEGER,
+                display_order INTEGER,
+                value TEXT
+            );
+            INSERT INTO records VALUES
+                ('a', 99, 0, 'ninety-nine'),
+                ('b', 5, 5, 'five'),
+                ('c', 2, 2, 'two'),
+                ('d', 3, 3, 'three'),
+                ('e', 4, 4, 'four'),
+                ('f', 40, 6, 'forty'),
+                ('g', 1, 1, 'one');
+        `);
+
+        const disk = new BetterSqlite3(databasePath);
+        const oldOffsetTargets = [1, 5].map(offset => {
+            const rowid = disk.prepare('SELECT rowid FROM records LIMIT 1 OFFSET ?').get(offset).rowid;
+            return disk.prepare('SELECT Id FROM records WHERE rowid = ?').get(rowid).Id;
+        });
+        disk.close();
+        assert.deepStrictEqual(oldOffsetTargets, [5, 40]);
+
+        await service.openDatabase(databasePath);
+        const data = await service.getTableData('records');
+        const displayOrderIndex = data.columns.indexOf('display_order');
+        const idIndex = data.columns.indexOf('Id');
+        const visible = data.values
+            .map((row, sourceIndex) => ({ row, identity: data.rowIdentities[sourceIndex] }))
+            .sort((a, b) => Number(a.row[displayOrderIndex]) - Number(b.row[displayOrderIndex]));
+        assert.strictEqual(visible[1].row[idIndex], 1);
+        assert.strictEqual(visible[5].row[idIndex], 5);
+
+        await service.updateCellData('records', visible[1].identity!, 'value', 'selected-one');
+        await service.updateCellData('records', visible[5].identity!, 'value', 'selected-five');
+
+        service.closeDatabase();
+        assert.deepStrictEqual(readRows('SELECT Id, value FROM records WHERE Id IN (1, 5, 40) ORDER BY Id'), [
+            { Id: 1, value: 'selected-one' },
+            { Id: 5, value: 'selected-five' },
+            { Id: 40, value: 'forty' }
+        ]);
+    });
+
+    test('keeps identity attached through first/middle row sorting, filtering, and virtual source ordering', async () => {
+        createDatabase(`
+            CREATE TABLE records (Id INTEGER PRIMARY KEY, value TEXT);
+            INSERT INTO records VALUES (1, 'one'), (5, 'five'), (40, 'forty'), (75, 'seventy-five');
+        `);
+        await service.openDatabase(databasePath);
+        const data = await service.getTableDataPaginated('records', 1, 100);
+
+        const pairedRows = data.values.map((row, index) => ({ row, identity: data.rowIdentities[index] }));
+        const sorted = [...pairedRows].sort((a, b) => Number(b.row[0]) - Number(a.row[0]));
+        const firstVisibleId1 = sorted.find(item => item.row[0] === 1);
+        assert.ok(firstVisibleId1?.identity);
+        await service.updateCellData('records', firstVisibleId1.identity, 'value', 'sorted-one');
+
+        const filtered = pairedRows.filter(item => String(item.row[0]).includes('5'));
+        const middleId5 = filtered.find(item => item.row[0] === 5);
+        assert.ok(middleId5?.identity);
+        await service.updateCellData('records', middleId5.identity, 'value', 'filtered-five');
+
+        const virtualOrder = [3, 0, 2, 1];
+        const virtualVisibleRow = pairedRows[virtualOrder[2]];
+        assert.strictEqual(virtualVisibleRow.row[0], 40);
+        assert.ok(virtualVisibleRow.identity);
+        await service.updateCellData('records', virtualVisibleRow.identity, 'value', 'virtual-forty');
+
+        service.closeDatabase();
+        assert.deepStrictEqual(readRows('SELECT Id, value FROM records ORDER BY Id'), [
+            { Id: 1, value: 'sorted-one' },
+            { Id: 5, value: 'filtered-five' },
+            { Id: 40, value: 'virtual-forty' },
+            { Id: 75, value: 'seventy-five' }
+        ]);
+    });
+
+    test('uses implicit rowid on a later pagination page and leaves neighbouring rows unchanged', async () => {
+        createDatabase(`
+            CREATE TABLE notes (value TEXT);
+            INSERT INTO notes(value) VALUES ('one'), ('two'), ('three'), ('four'), ('five'), ('six');
+        `);
+        await service.openDatabase(databasePath);
+        const secondPage = await service.getTableDataPaginated('notes', 2, 2);
+
+        assert.strictEqual(secondPage.rowIdentities[0]?.kind, 'rowid');
+        assert.deepStrictEqual(secondPage.values.map(row => row[0]), ['three', 'four']);
+        await service.updateCellData('notes', secondPage.rowIdentities[0]!, 'value', 'page-two-first');
+
+        service.closeDatabase();
+        assert.deepStrictEqual(readRows('SELECT rowid, value FROM notes ORDER BY rowid'), [
+            { rowid: 1, value: 'one' },
+            { rowid: 2, value: 'two' },
+            { rowid: 3, value: 'page-two-first' },
+            { rowid: 4, value: 'four' },
+            { rowid: 5, value: 'five' },
+            { rowid: 6, value: 'six' }
+        ]);
+    });
+
+    test('supports text and composite primary keys, WITHOUT ROWID, and primary-key edits', async () => {
+        createDatabase(`
+            CREATE TABLE text_keys (code TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO text_keys VALUES ('alpha', 'A'), ('beta', 'B');
+            CREATE TABLE memberships (
+                account TEXT,
+                region TEXT,
+                value TEXT,
+                PRIMARY KEY (account, region)
+            ) WITHOUT ROWID;
+            INSERT INTO memberships VALUES ('acct', 'eu', 'old'), ('acct', 'us', 'untouched');
+        `);
+        await service.openDatabase(databasePath);
+
+        const textRows = await service.getTableData('text_keys');
+        const originalTextIdentity = identityFor(textRows, 'code', 'alpha');
+        const keyEdit = await service.updateCellData('text_keys', originalTextIdentity, 'code', 'alpha-renamed');
+        await service.updateCellData('text_keys', keyEdit.identity, 'value', 'renamed-value');
+
+        const compositeRows = await service.getTableData('memberships');
+        assert.strictEqual(compositeRows.rowIdentities[0]?.parts.length, 2);
+        const euIdentity = identityFor(compositeRows, 'region', 'eu');
+        await service.updateCellData('memberships', euIdentity, 'value', 'composite-updated');
+
+        service.closeDatabase();
+        assert.deepStrictEqual(readRows('SELECT code, value FROM text_keys ORDER BY code'), [
+            { code: 'alpha-renamed', value: 'renamed-value' },
+            { code: 'beta', value: 'B' }
+        ]);
+        assert.deepStrictEqual(readRows('SELECT account, region, value FROM memberships ORDER BY region'), [
+            { account: 'acct', region: 'eu', value: 'composite-updated' },
+            { account: 'acct', region: 'us', value: 'untouched' }
+        ]);
+    });
+
+    test('binds quotes, Unicode, and null values without changing the selected identity', async () => {
+        createDatabase(`
+            CREATE TABLE content (id INTEGER PRIMARY KEY, value TEXT);
+            INSERT INTO content VALUES (1, 'first'), (5, 'second'), (40, 'third');
+            CREATE TABLE "odd""table" ("key""part" TEXT PRIMARY KEY, "value""text" TEXT);
+            INSERT INTO "odd""table" VALUES ('quoted-key', 'old');
+        `);
+        await service.openDatabase(databasePath);
+        const data = await service.getTableData('content');
+
+        await service.updateCellData('content', identityFor(data, 'id', 1), 'value', "O'Reilly — 雪");
+        await service.updateCellData('content', identityFor(data, 'id', 5), 'value', null);
+        const quoted = await service.getTableData('odd"table');
+        await service.updateCellData(
+            'odd"table',
+            identityFor(quoted, 'key"part', 'quoted-key'),
+            'value"text',
+            'safe " identifier'
+        );
+
+        service.closeDatabase();
+        assert.deepStrictEqual(readRows('SELECT id, value FROM content ORDER BY id'), [
+            { id: 1, value: "O'Reilly — 雪" },
+            { id: 5, value: null },
+            { id: 40, value: 'third' }
+        ]);
+        assert.deepStrictEqual(readRows('SELECT "value""text" AS value FROM "odd""table"'), [
+            { value: 'safe " identifier' }
+        ]);
+    });
+
+    test('rejects stale, ambiguous, and unavailable row identities without persisting changes', async () => {
+        createDatabase(`
+            CREATE TABLE ambiguous (a TEXT, b TEXT, value TEXT, PRIMARY KEY (a, b));
+            INSERT INTO ambiguous VALUES (NULL, 'same', 'first'), (NULL, 'same', 'second');
+            CREATE TABLE shadowed (rowid TEXT, _rowid_ TEXT, oid TEXT, value TEXT);
+            INSERT INTO shadowed VALUES ('r', 'u', 'o', 'unchanged');
+            CREATE VIEW ambiguous_view AS SELECT * FROM ambiguous;
+        `);
+        await service.openDatabase(databasePath);
+
+        const ambiguous = await service.getTableData('ambiguous');
+        await assert.rejects(
+            service.updateCellData('ambiguous', ambiguous.rowIdentities[0]!, 'value', 'must-rollback'),
+            /expected one changed row but SQLite reported 2/
+        );
+
+        const staleIdentity: RowIdentity = {
+            kind: 'primaryKey',
+            parts: [{ column: 'a', value: 'missing' }, { column: 'b', value: 'missing' }]
+        };
+        await assert.rejects(
+            service.updateCellData('ambiguous', staleIdentity, 'value', 'must-not-write'),
+            /No row was updated/
+        );
+
+        const shadowed = await service.getTableData('shadowed');
+        assert.strictEqual(shadowed.editable, false);
+        assert.ok(shadowed.rowIdentities.every(identity => identity === null));
+        assert.match(shadowed.editError || '', /rowid aliases are shadowed/);
+
+        const view = await service.getTableData('ambiguous_view');
+        assert.strictEqual(view.editable, false);
+        assert.match(view.editError || '', /Views cannot be edited safely/);
+
+        service.closeDatabase();
+        assert.deepStrictEqual(readRows('SELECT value FROM ambiguous ORDER BY rowid'), [
+            { value: 'first' },
+            { value: 'second' }
+        ]);
+        assert.deepStrictEqual(readRows('SELECT value FROM shadowed'), [{ value: 'unchanged' }]);
+    });
+});

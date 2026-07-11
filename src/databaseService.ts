@@ -43,6 +43,38 @@ export interface QueryResult {
     values: any[][];
 }
 
+export interface RowIdentityPart {
+    column: string;
+    value: any;
+}
+
+export interface RowIdentity {
+    kind: 'primaryKey' | 'rowid';
+    parts: RowIdentityPart[];
+}
+
+export interface EditableTableData extends QueryResult {
+    rowIdentities: Array<RowIdentity | null>;
+    editable: boolean;
+    editError?: string;
+}
+
+export interface CellUpdateResult {
+    changes: number;
+    identity: RowIdentity;
+    value: any;
+}
+
+interface TableIdentityDefinition {
+    kind: 'primaryKey' | 'rowid';
+    columns: string[];
+}
+
+interface TableEditability {
+    definition: TableIdentityDefinition | null;
+    reason?: string;
+}
+
 /** 
  * A single change in a table since our last sync.
  */
@@ -472,76 +504,252 @@ export class DatabaseService {
         }
     }
 
-    async getTableData(tableName: string, limit: number = 1000, offset: number = 0): Promise<QueryResult> {
-        const query = `SELECT * FROM "${tableName}" LIMIT ${limit} OFFSET ${offset}`;
-        return this.executeQuery(query);
+    async getTableData(tableName: string, limit: number = 1000, offset: number = 0): Promise<EditableTableData> {
+        return this.getTableDataWithIdentities(tableName, limit, offset);
     }
 
-    public async getTableDataPaginated(tableName: string, page: number = 1, pageSize: number = 100): Promise<QueryResult> {
-        const offset = (page - 1) * pageSize;
-        const query = `SELECT * FROM "${tableName}" LIMIT ${pageSize} OFFSET ${offset}`;
-        return this.executeQuery(query);
+    public async getTableDataPaginated(tableName: string, page: number = 1, pageSize: number = 100): Promise<EditableTableData> {
+        const safePage = Number.isInteger(page) && page > 0 ? page : 1;
+        const safePageSize = Number.isInteger(pageSize) && pageSize > 0 ? pageSize : 100;
+        const offset = (safePage - 1) * safePageSize;
+        return this.getTableDataWithIdentities(tableName, safePageSize, offset);
     }
 
     async getRowCount(tableName: string): Promise<number> {
-        const result = await this.executeQuery(`SELECT COUNT(*) as count FROM "${tableName}"`);
+        const result = await this.executeQuery(`SELECT COUNT(*) as count FROM ${this.quoteIdentifier(tableName)}`);
         return result.values[0][0] as number;
     }
 
-    async updateCellData(tableName: string, rowId: any, columnName: string, newValue: any): Promise<void> {
+    private async getTableEditability(tableName: string): Promise<TableEditability> {
         if (!this.db) {
             throw new Error('Database not opened');
         }
 
-        this.debugLog('CellUpdate', 'Starting cell update:', {
-            tableName,
-            rowId,
-            columnName,
-            newValue,
-            newValueType: typeof newValue
+        const tableStmt = this.db.prepare(`
+            SELECT type, sql
+            FROM sqlite_master
+            WHERE name = ? AND type IN ('table', 'view')
+            LIMIT 1
+        `);
+        tableStmt.bind([tableName]);
+        const found = tableStmt.step();
+        const table = found ? tableStmt.getAsObject() : null;
+        tableStmt.free();
+
+        if (!table) {
+            return { definition: null, reason: `Table ${tableName} no longer exists.` };
+        }
+        if (table.type !== 'table') {
+            return { definition: null, reason: 'Views cannot be edited safely because they do not expose stable row identity.' };
+        }
+
+        const infoStmt = this.db.prepare(`PRAGMA table_info(${this.quoteIdentifier(tableName)})`);
+        const columns: Array<{ name: string; pkOrder: number }> = [];
+        while (infoStmt.step()) {
+            const row = infoStmt.getAsObject();
+            columns.push({
+                name: row.name as string,
+                pkOrder: Number(row.pk) || 0
+            });
+        }
+        infoStmt.free();
+
+        const primaryKeyColumns = columns
+            .filter(column => column.pkOrder > 0)
+            .sort((a, b) => a.pkOrder - b.pkOrder)
+            .map(column => column.name);
+        if (primaryKeyColumns.length > 0) {
+            return {
+                definition: {
+                    kind: 'primaryKey',
+                    columns: primaryKeyColumns
+                }
+            };
+        }
+
+        const createSql = typeof table.sql === 'string' ? table.sql : '';
+        if (/\bWITHOUT\s+ROWID\b/i.test(createSql)) {
+            return {
+                definition: null,
+                reason: 'This WITHOUT ROWID table has no declared primary key and cannot be edited safely.'
+            };
+        }
+
+        const declaredNames = new Set(columns.map(column => column.name.toLowerCase()));
+        const rowidAlias = ['rowid', '_rowid_', 'oid'].find(alias => !declaredNames.has(alias));
+        if (!rowidAlias) {
+            return {
+                definition: null,
+                reason: 'This table has no declared primary key and all SQLite rowid aliases are shadowed.'
+            };
+        }
+
+        return {
+            definition: {
+                kind: 'rowid',
+                columns: [rowidAlias]
+            }
+        };
+    }
+
+    private async getTableDataWithIdentities(tableName: string, limit: number, offset: number): Promise<EditableTableData> {
+        if (!this.db) {
+            throw new Error('Database not opened');
+        }
+
+        const safeLimit = Number.isInteger(limit) && limit > 0 ? limit : 1000;
+        const safeOffset = Number.isInteger(offset) && offset >= 0 ? offset : 0;
+        const editability = await this.getTableEditability(tableName);
+        const definition = editability.definition;
+        const hiddenIdentity = definition?.kind === 'rowid';
+        const identitySelection = hiddenIdentity
+            ? `${this.quoteIdentifier(definition.columns[0])} AS ${this.quoteIdentifier('__intelliview_row_identity__')}, `
+            : '';
+        const query = `SELECT ${identitySelection}* FROM ${this.quoteIdentifier(tableName)} LIMIT ? OFFSET ?`;
+        const stmt = this.db.prepare(query);
+        stmt.bind([safeLimit, safeOffset]);
+
+        let columns = stmt.getColumnNames();
+        const rawRows: any[][] = [];
+        while (stmt.step()) {
+            rawRows.push(stmt.get());
+        }
+        stmt.free();
+
+        if (hiddenIdentity) {
+            columns = columns.slice(1);
+        }
+
+        const values = hiddenIdentity ? rawRows.map(row => row.slice(1)) : rawRows;
+        const rowIdentities: Array<RowIdentity | null> = rawRows.map(row => {
+            if (!definition) {
+                return null;
+            }
+            if (definition.kind === 'rowid') {
+                return {
+                    kind: 'rowid',
+                    parts: [{ column: definition.columns[0], value: row[0] }]
+                };
+            }
+
+            return {
+                kind: 'primaryKey',
+                parts: definition.columns.map(column => {
+                    const columnIndex = columns.indexOf(column);
+                    if (columnIndex < 0) {
+                        throw new Error(`Primary-key column ${column} is missing from the table result.`);
+                    }
+                    return { column, value: row[columnIndex] };
+                })
+            };
         });
 
-        // Sanitize inputs
-        const sanitizedTableName = tableName.replace(/"/g, '""');
-        const sanitizedColumnName = columnName.replace(/"/g, '""');
-        
-        // Build the UPDATE query
-        const updateQuery = `UPDATE "${sanitizedTableName}" SET "${sanitizedColumnName}" = ? WHERE rowid = ?`;
-        
-        try {
-            const stmt = this.db.prepare(updateQuery);
-            
-            // Convert the new value to the appropriate type
-            let processedValue = newValue;
-            if (newValue === '' || newValue === null) {
-                processedValue = null;
-            } else if (typeof newValue === 'string') {
-                // Try to parse as number if it looks like a number
-                const numValue = parseFloat(newValue);
-                if (!isNaN(numValue) && isFinite(numValue) && newValue.trim() === numValue.toString()) {
-                    processedValue = numValue;
-                }
+        return {
+            columns,
+            values,
+            rowIdentities,
+            editable: definition !== null,
+            editError: editability.reason
+        };
+    }
+
+    private processEditedValue(newValue: any): any {
+        if (newValue === '' || newValue === null) {
+            return null;
+        }
+        if (typeof newValue === 'string') {
+            const numValue = Number(newValue);
+            if (Number.isFinite(numValue) && newValue.trim() !== '' && newValue.trim() === String(numValue)) {
+                return numValue;
             }
-            
-            this.debugLog('CellUpdate', 'Executing query:', updateQuery);
-            this.debugLog('CellUpdate', 'Parameters:', [processedValue, rowId]);
-            
-            stmt.run([processedValue, rowId]);
+        }
+        return newValue;
+    }
+
+    async updateCellData(tableName: string, identity: RowIdentity, columnName: string, newValue: any): Promise<CellUpdateResult> {
+        if (!this.db) {
+            throw new Error('Database not opened');
+        }
+
+        const editability = await this.getTableEditability(tableName);
+        const definition = editability.definition;
+        if (!definition) {
+            throw new Error(editability.reason || 'This row cannot be identified safely and uniquely.');
+        }
+
+        const tableInfo = await this.getTableInfo(tableName);
+        if (!tableInfo.some(column => column.name === columnName)) {
+            throw new Error(`Column ${columnName} does not exist in table ${tableName}.`);
+        }
+        if (!identity || identity.kind !== definition.kind || !Array.isArray(identity.parts)) {
+            throw new Error('The selected row identity is missing or no longer matches the table schema. Refresh the table and try again.');
+        }
+        const suppliedColumns = identity.parts.map(part => part?.column);
+        if (
+            suppliedColumns.length !== definition.columns.length ||
+            suppliedColumns.some((column, index) => column !== definition.columns[index]) ||
+            identity.parts.some(part => !part || part.value === undefined)
+        ) {
+            throw new Error('The selected row identity is incomplete or no longer matches the table schema. Refresh the table and try again.');
+        }
+
+        const processedValue = this.processEditedValue(newValue);
+        const whereClause = definition.columns
+            .map(column => `${this.quoteIdentifier(column)} IS ?`)
+            .join(' AND ');
+        const updateQuery = `UPDATE ${this.quoteIdentifier(tableName)} SET ${this.quoteIdentifier(columnName)} = ? WHERE ${whereClause}`;
+        const parameters = [processedValue, ...identity.parts.map(part => part.value)];
+        let stmt: any = null;
+        let transactionOpen = false;
+
+        try {
+            this.db.run('BEGIN IMMEDIATE TRANSACTION');
+            transactionOpen = true;
+            stmt = this.db.prepare(updateQuery);
+            stmt.run(parameters);
             stmt.free();
-            
-            this.debugLog('CellUpdate', `Successfully updated ${tableName}.${columnName} = ${processedValue} where rowid = ${rowId}`);
-            
-            // CRITICAL: Save changes back to the database file
+            stmt = null;
+
+            const changes = Number(this.db.getRowsModified());
+            if (changes === 0) {
+                throw new Error('No row was updated. The record may have changed or been deleted; refresh the table and try again.');
+            }
+            if (changes !== 1) {
+                throw new Error(`Critical update failure: expected one changed row but SQLite reported ${changes}. The update was rolled back.`);
+            }
+
+            this.db.run('COMMIT');
+            transactionOpen = false;
+
+            const nextIdentity: RowIdentity = {
+                kind: identity.kind,
+                parts: identity.parts.map(part => ({
+                    column: part.column,
+                    value: part.column === columnName ? processedValue : part.value
+                }))
+            };
+
             await this.saveChangesToFile();
-            // Mark as internal update so watcher ignores this event
             if (this.currentDatabasePath) {
                 markInternalUpdate(this.currentDatabasePath);
             }
-            
-            this.debugLog('CellUpdate', 'Cell update completed successfully');
-            
+
+            return {
+                changes,
+                identity: nextIdentity,
+                value: processedValue
+            };
         } catch (error) {
-            this.debugError('CellUpdate', 'Failed to update cell:', error);
+            if (stmt) {
+                stmt.free();
+            }
+            if (transactionOpen) {
+                try {
+                    this.db.run('ROLLBACK');
+                } catch {
+                    // Preserve the original update failure.
+                }
+            }
             throw new Error(`Failed to update cell: ${error}`);
         }
     }
@@ -717,27 +925,6 @@ export class DatabaseService {
         } catch (error) {
             this.debugError('ReEncrypt', 'Re-encryption error:', error);
             throw new Error(`Failed to re-encrypt database: ${error}`);
-        }
-    }
-
-    async getCellRowId(tableName: string, rowIndex: number): Promise<any> {
-        if (!this.db) {
-            throw new Error('Database not opened');
-        }
-
-        const sanitizedTableName = tableName.replace(/"/g, '""');
-        const query = `SELECT rowid FROM "${sanitizedTableName}" LIMIT 1 OFFSET ${rowIndex}`;
-        
-        try {
-            const result = await this.executeQuery(query);
-            
-            if (result.values.length > 0) {
-                const rowId = result.values[0][0];
-                return rowId;
-            }
-            throw new Error('Row not found');
-        } catch (error) {
-            throw new Error(`Failed to get row ID: ${error}`);
         }
     }
 

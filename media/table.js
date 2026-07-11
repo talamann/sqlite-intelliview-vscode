@@ -326,6 +326,8 @@ function createDataTable(data, columns, tableName = "", options = {}) {
     isQueryResult = false, // Whether this is a query result
     query = null, // Original SQL query for result tabs
     allowEditing = null, // Override editing permission
+    rowIdentities = [], // Stable database identities aligned with source rows
+    editError = "", // Explanation shown when safe editing is unavailable
   } = options;
 
   // Create foreign key lookup map
@@ -423,6 +425,7 @@ function createDataTable(data, columns, tableName = "", options = {}) {
     columns,
     startIndex,
     tableName,
+    rowIdentities,
   });
 
   if (virtualize) {
@@ -439,6 +442,7 @@ function createDataTable(data, columns, tableName = "", options = {}) {
         foreignKeyMap,
         options,
         tableName,
+        rowIdentities,
       });
     } catch (_) {
       // ignore stashing errors (best-effort)
@@ -480,7 +484,11 @@ function createDataTable(data, columns, tableName = "", options = {}) {
             isQueryResult
               ? `<span class="table-readonly-indicator" title="Query results are read-only">🧮 Query Result</span>`
               : !isEditable
-              ? `<span class="table-readonly-indicator" title="Table is read-only">🔒 Read-only</span>`
+              ? `<span class="table-readonly-indicator" title="${escapeHtmlFast(
+                  editError || "Table is read-only"
+                )}">🔒 ${
+                  editError ? "Read-only: no safe row identity" : "Read-only"
+                }</span>`
               : ``
           }
           ${

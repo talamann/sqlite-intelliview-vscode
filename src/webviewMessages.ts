@@ -1,3 +1,5 @@
+import type { RowIdentity } from './databaseService';
+
 export type WalCheckpointModeSetting = 'full' | 'passive' | 'off';
 
 export interface WebviewSettingsPayload {
@@ -42,7 +44,8 @@ export interface GetTableDataMessage {
 export interface UpdateCellDataMessage {
     type: 'updateCellData';
     tableName: string;
-    rowIndex: number;
+    requestId: string;
+    rowIdentity: RowIdentity;
     columnName: string;
     newValue: unknown;
     key?: string;
@@ -165,6 +168,20 @@ function hasDefinedProperty(value: Record<string, unknown>, key: string): boolea
     return Object.prototype.hasOwnProperty.call(value, key) && value[key] !== undefined;
 }
 
+function isRowIdentity(value: unknown): value is RowIdentity {
+    if (!isRecord(value) || (value.kind !== 'primaryKey' && value.kind !== 'rowid') || !Array.isArray(value.parts)) {
+        return false;
+    }
+    if (value.parts.length === 0) {
+        return false;
+    }
+    return value.parts.every(part => (
+        isRecord(part) &&
+        isString(part.column) &&
+        hasDefinedProperty(part, 'value')
+    ));
+}
+
 function isExtensionMessageType(type: unknown): type is ExtensionToWebviewMessage['type'] {
     return typeof type === 'string' && EXTENSION_TO_WEBVIEW_TYPES.has(type as ExtensionToWebviewMessage['type']);
 }
@@ -272,7 +289,8 @@ export function isWebviewToExtensionMessage(value: unknown): value is WebviewToE
         case 'updateCellData':
             return (
                 isString(value.tableName) &&
-                typeof value.rowIndex === 'number' &&
+                isString(value.requestId) &&
+                isRowIdentity(value.rowIdentity) &&
                 isString(value.columnName) &&
                 hasDefinedProperty(value, 'newValue') &&
                 isOptionalString(value.key)
