@@ -2760,6 +2760,14 @@ function initializeTableEvents(tableWrapper) {
       }
     });
 
+    tableWrapper.addEventListener("input", (e) => {
+      const target = e.target instanceof HTMLElement ? e.target : null;
+      if (!target?.classList.contains("cell-input")) {
+        return;
+      }
+      target.closest(".data-cell")?.setAttribute("data-edit-dirty", "true");
+    });
+
     tableWrapper.addEventListener("focusout", (e) => {
       const target = e.target instanceof HTMLElement ? e.target : null;
       if (!target) {
@@ -2808,13 +2816,17 @@ function startCellEditing(cell) {
   // Get current value
   const cellContent = cell.querySelector(".cell-content");
   const originalValue = cellContent.getAttribute("data-original-value") || "";
+  const nullAttribute = cellContent.getAttribute("data-original-is-null");
   const isNull =
-    cellContent.querySelector("em") &&
-    cellContent.textContent.trim() === "NULL";
+    nullAttribute === "true" ||
+    (nullAttribute === null &&
+      cellContent.querySelector("em") &&
+      cellContent.textContent.trim() === "NULL");
   const currentValue = isNull ? "" : originalValue;
 
   // Set up editing state
   cell.classList.add("editing");
+  cell.setAttribute("data-edit-dirty", "false");
   const input = cell.querySelector(".cell-input");
   if (input) {
     /** @type {HTMLInputElement} */ (input).value = currentValue;
@@ -2879,12 +2891,18 @@ function saveCellEdit(cell) {
   }
 
   const newValue = /** @type {HTMLInputElement} */ (input).value;
-  const originalValue =
-    cell.querySelector(".cell-content")?.getAttribute("data-original-value") ||
-    "";
+  const cellContent = cell.querySelector(".cell-content");
+  const originalValue = cellContent?.getAttribute("data-original-value") || "";
+  const nullAttribute = cellContent?.getAttribute("data-original-is-null");
+  const originalIsNull =
+    nullAttribute === "true" ||
+    (nullAttribute === null &&
+      cellContent?.querySelector("em") &&
+      cellContent.textContent.trim() === "NULL");
+  const editIsDirty = cell.getAttribute("data-edit-dirty") === "true";
 
   // Check if value actually changed
-  if (newValue === originalValue) {
+  if (newValue === originalValue && (!originalIsNull || !editIsDirty)) {
     cancelCellEdit(cell);
     return;
   }
@@ -2994,6 +3012,7 @@ function cancelCellEdit(cell) {
   }
   cell.classList.remove("editing", "saving", "error");
   cell.removeAttribute("data-edit-request-id");
+  cell.removeAttribute("data-edit-dirty");
   const input = cell.querySelector(".cell-input");
   if (input) {
     /** @type {HTMLInputElement} */ (input).value = "";
@@ -3060,12 +3079,14 @@ function handleCellUpdateSuccess(message) {
     // Update the cell content
     const cellContent = cell.querySelector(".cell-content");
     if (cellContent) {
+      const isNull = newValue === null || newValue === undefined;
       cellContent.setAttribute(
         "data-original-value",
-        newValue === null || newValue === undefined ? "" : String(newValue),
+        isNull ? "" : String(newValue),
       );
+      cellContent.setAttribute("data-original-is-null", String(isNull));
 
-      if (newValue === null || newValue === undefined) {
+      if (isNull) {
         cellContent.innerHTML = "<em>NULL</em>";
       } else {
         cellContent.textContent = newValue;
@@ -3075,6 +3096,7 @@ function handleCellUpdateSuccess(message) {
     // Remove editing state
     cell.classList.remove("editing", "saving", "error");
     cell.removeAttribute("data-edit-request-id");
+    cell.removeAttribute("data-edit-dirty");
 
     // Show success feedback
     cell.style.backgroundColor = "var(--vscode-list-activeSelectionBackground)";
@@ -3565,7 +3587,17 @@ function handleTableDataDelta({
       if (cell) {
         const cc = cell.querySelector(".cell-content");
         if (cc) {
-          cc.textContent = val === null ? "" : String(val);
+          const isNull = val === null || val === undefined;
+          cc.setAttribute(
+            "data-original-value",
+            isNull ? "" : String(val),
+          );
+          cc.setAttribute("data-original-is-null", String(isNull));
+          if (isNull) {
+            cc.innerHTML = "<em>NULL</em>";
+          } else {
+            cc.textContent = String(val);
+          }
         }
       }
     });

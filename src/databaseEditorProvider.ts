@@ -635,7 +635,17 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
     }
 
     private async handleTableDataRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, key?: string, page?: number, pageSize?: number, setSync: boolean = true, syncToken?: TableSyncState) {
-        const syncIsCurrent = () => !syncToken || this.lastSync.get(databasePath) === syncToken;
+        const requestToken = syncToken || {
+            table: tableName,
+            since: '',
+            page: page ?? 1,
+            pageSize: pageSize ?? 1000,
+            key
+        };
+        if (!syncToken) {
+            this.lastSync.set(databasePath, requestToken);
+        }
+        const syncIsCurrent = () => this.lastSync.get(databasePath) === requestToken;
         try {
             if (!syncIsCurrent()) {
                 return;
@@ -745,15 +755,8 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
             });
             // cache this page for future diffs ONLY if this is a user-initiated load
             if (setSync) {
-                const nextSync = syncToken || {
-                    table: tableName!,
-                    since: '',
-                    page: page!,
-                    pageSize: pageSize!,
-                    key
-                };
-                nextSync.lastPageData = result.values;
-                this.lastSync.set(databasePath, nextSync);
+                requestToken.lastPageData = result.values;
+                this.lastSync.set(databasePath, requestToken);
                 this.debugLog('getTableDataPaginated', 'lastSync set for', databasePath, {
                     table: tableName,
                     page,

@@ -740,7 +740,7 @@ function renderTableCellHtml(
   let cellContentHtml = "";
   if (cell === null || cell === undefined) {
     cellContentHtml =
-      '<div class="cell-content" data-original-value=""><em>NULL</em></div>';
+      '<div class="cell-content" data-original-value="" data-original-is-null="true"><em>NULL</em></div>';
   } else if (isBlob && blobBytes) {
     const sizeText = formatBytes(blobBytes.length);
     const mime = detectImageMime(blobBytes);
@@ -775,7 +775,7 @@ function renderTableCellHtml(
       raw.length > CELL_ORIGINAL_LIMIT ? ' data-original-truncated="true"' : "";
     cellContentHtml = `<div class="cell-content" data-original-value="${escapeHtmlFast(
       original
-    )}"${truncatedAttr}>${escapeHtmlFast(display)}</div>`;
+    )}" data-original-is-null="false"${truncatedAttr}>${escapeHtmlFast(display)}</div>`;
   }
 
   const cellEditable = isEditable && !isBlob;

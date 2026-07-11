@@ -204,9 +204,11 @@ suite('Stable cell editing', () => {
 
         const capped = await service.getTableData('many_rows', 100001);
         const unsafe = await service.getTableData('many_rows', Number.MAX_SAFE_INTEGER + 1);
+        const secondCappedPage = await service.getTableDataPaginated('many_rows', 2, 200000);
 
         assert.strictEqual(capped.values.length, 100000);
         assert.strictEqual(unsafe.values.length, 1000);
+        assert.deepStrictEqual(secondCappedPage.values, [[100001]]);
     });
 
     test('supports text and composite primary keys, WITHOUT ROWID, and primary-key edits', async () => {

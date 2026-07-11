@@ -533,7 +533,7 @@ export class DatabaseService {
 
     public async getTableDataPaginated(tableName: string, page: number = 1, pageSize: number = 100): Promise<EditableTableData> {
         const safePage = Number.isInteger(page) && page > 0 ? page : 1;
-        const safePageSize = Number.isInteger(pageSize) && pageSize > 0 ? pageSize : 100;
+        const safePageSize = Number.isInteger(pageSize) && pageSize > 0 ? Math.min(pageSize, 100000) : 100;
         const offset = (safePage - 1) * safePageSize;
         return this.getTableDataWithIdentities(tableName, safePageSize, offset);
     }
