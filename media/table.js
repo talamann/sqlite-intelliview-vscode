@@ -486,9 +486,7 @@ function createDataTable(data, columns, tableName = "", options = {}) {
               : !isEditable
               ? `<span class="table-readonly-indicator" title="${escapeHtmlFast(
                   editError || "Table is read-only"
-                )}">🔒 ${
-                  editError ? "Read-only: no safe row identity" : "Read-only"
-                }</span>`
+                )}">🔒 Read-only</span>`
               : ``
           }
           ${
