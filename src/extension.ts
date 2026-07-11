@@ -3,8 +3,50 @@
 import * as vscode from 'vscode';
 import { DatabaseEditorProvider } from './databaseEditorProvider';
 import { DatabaseExplorerProvider } from './databaseExplorerProvider';
+import { getSQLiteFileExtensions, isSQLiteFilePath } from './fileExtensions';
 
 let databaseExplorerProvider: DatabaseExplorerProvider;
+
+function getAdditionalFileExtensions(): unknown[] {
+	const configured = vscode.workspace
+		.getConfiguration('sqliteIntelliView')
+		.get<unknown>('additionalFileExtensions', []);
+	return Array.isArray(configured) ? configured : [];
+}
+
+function getDatabaseDialogFilters(): Record<string, string[]> {
+	return {
+		'SQLite Database': getSQLiteFileExtensions(getAdditionalFileExtensions()),
+		'All Files': ['*']
+	};
+}
+
+function getTabInputUri(input: unknown): vscode.Uri | undefined {
+	if (!input || typeof input !== 'object' || !('uri' in input)) {
+		return undefined;
+	}
+
+	const uri = input.uri;
+	return uri instanceof vscode.Uri ? uri : undefined;
+}
+
+function getActiveDatabaseUri(): vscode.Uri | undefined {
+	const additionalExtensions = getAdditionalFileExtensions();
+	const editorUri = vscode.window.activeTextEditor?.document.uri;
+	if (editorUri && isSQLiteFilePath(editorUri.fsPath, additionalExtensions)) {
+		return editorUri;
+	}
+
+	const input = vscode.window.tabGroups.activeTabGroup?.activeTab?.input;
+	const inputUri = getTabInputUri(input);
+	const isCustomDatabaseEditor = input instanceof vscode.TabInputCustom
+		&& input.viewType === DatabaseEditorProvider.viewType;
+	if (inputUri && (isCustomDatabaseEditor || isSQLiteFilePath(inputUri.fsPath, additionalExtensions))) {
+		return inputUri;
+	}
+
+	return undefined;
+}
 
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
@@ -34,10 +76,6 @@ export function activate(context: vscode.ExtensionContext) {
 
 	// Register commands
 	const openDatabaseCommand = vscode.commands.registerCommand('sqlite-intelliview-vscode.openDatabase', async (uri?: vscode.Uri) => {
-		const isDatabaseFile = (target: vscode.Uri) => {
-			return ['.db', '.sqlite', '.sqlite3'].some(ext => target.fsPath.toLowerCase().endsWith(ext));
-		};
-
 		let dbUri: vscode.Uri | undefined = uri;
 
 		if (!dbUri) {
@@ -45,10 +83,7 @@ export function activate(context: vscode.ExtensionContext) {
 				canSelectFiles: true,
 				canSelectFolders: false,
 				canSelectMany: false,
-				filters: {
-					'SQLite Database': ['db', 'sqlite', 'sqlite3'],
-					'All Files': ['*']
-				}
+				filters: getDatabaseDialogFilters()
 			});
 
 			if (!result || result.length === 0) {
@@ -58,12 +93,9 @@ export function activate(context: vscode.ExtensionContext) {
 			dbUri = result[0];
 		}
 
-		if (!isDatabaseFile(dbUri)) {
-			vscode.window.showWarningMessage('Selected file is not a recognized database file');
-			return;
-		}
-
 		// Open with our custom editor (opening as text will often succeed but won't use the SQLite UI).
+		// DatabaseService validates the SQLite header and attempts a query after opening, so
+		// explicit opens are not rejected only because their filename has an unknown extension.
 		await vscode.commands.executeCommand('vscode.openWith', dbUri, DatabaseEditorProvider.viewType);
 
 		// Populate the Database Explorer (best-effort; encrypted DBs will require a key).
@@ -83,43 +115,18 @@ export function activate(context: vscode.ExtensionContext) {
 
 		if (encryptionKey) {
 			const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-			const isDatabaseFile = (target: vscode.Uri) => {
-				return ['.db', '.sqlite', '.sqlite3'].some(ext => target.fsPath.toLowerCase().endsWith(ext));
-			};
-			const getActiveDatabaseUri = (): vscode.Uri | undefined => {
-				const editorUri = vscode.window.activeTextEditor?.document.uri;
-				if (editorUri && isDatabaseFile(editorUri)) {
-					return editorUri;
-				}
-				const activeTab = vscode.window.tabGroups.activeTabGroup?.activeTab;
-				const input: any = activeTab?.input;
-				const inputUri: vscode.Uri | undefined = input && input.uri && typeof input.uri.fsPath === 'string' ? input.uri : undefined;
-				if (inputUri && isDatabaseFile(inputUri)) {
-					return inputUri;
-				}
-				return undefined;
-			};
-
 			let dbUri = getActiveDatabaseUri();
 			if (!dbUri) {
 				const picked = await vscode.window.showOpenDialog({
 					canSelectFiles: true,
 					canSelectFolders: false,
 					canSelectMany: false,
-					filters: {
-						'SQLite Database': ['db', 'sqlite', 'sqlite3'],
-						'All Files': ['*']
-					}
+					filters: getDatabaseDialogFilters()
 				});
 				if (!picked || picked.length === 0) {
 					return;
 				}
 				dbUri = picked[0];
-			}
-
-			if (!isDatabaseFile(dbUri)) {
-				vscode.window.showWarningMessage('Selected file is not a recognized database file');
-				return;
 			}
 
 			// Ensure the database is open in the custom editor.
@@ -188,23 +195,7 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	const checkpointWalCommand = vscode.commands.registerCommand('sqlite-intelliview-vscode.checkpointWal', async () => {
-		const isDatabasePath = (p: string) => ['.db', '.sqlite', '.sqlite3'].some(ext => p.toLowerCase().endsWith(ext));
-		const getActiveDatabasePath = (): string | undefined => {
-			const editorPath = vscode.window.activeTextEditor?.document.uri.fsPath;
-			if (editorPath && isDatabasePath(editorPath)) {
-				return editorPath;
-			}
-			const activeTab = vscode.window.tabGroups.activeTabGroup?.activeTab;
-			const input: any = activeTab?.input;
-			const inputUri: vscode.Uri | undefined = input && input.uri && typeof input.uri.fsPath === 'string' ? input.uri : undefined;
-			const inputPath = inputUri?.fsPath;
-			if (inputPath && isDatabasePath(inputPath)) {
-				return inputPath;
-			}
-			return undefined;
-		};
-
-		const dbPath = getActiveDatabasePath();
+		const dbPath = getActiveDatabaseUri()?.fsPath;
 		if (!dbPath) {
 			vscode.window.showWarningMessage('No database file is currently open');
 			return;
@@ -247,7 +238,7 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 
 	// Show welcome message
-	vscode.window.showInformationMessage('SQLite IntelliView is ready! Click on .db files to open them.');
+	vscode.window.showInformationMessage('SQLite IntelliView is ready! Open a SQLite database file to get started.');
 }
 
 // This method is called when your extension is deactivated

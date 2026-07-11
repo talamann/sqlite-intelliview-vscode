@@ -1,5 +1,12 @@
 # Change Log
 
+## Unreleased
+
+### Added
+
+- Built-in recognition for `.db3`, `.s3db`, and `.sl3` databases, with case-insensitive matching for all supported SQLite extensions.
+- `sqliteIntelliView.additionalFileExtensions` for recognizing custom SQLite filename extensions in commands and file pickers.
+
 ## [0.4.9] - 2026-04-27
 
 ### Changed
