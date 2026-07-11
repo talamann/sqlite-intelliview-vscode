@@ -236,6 +236,88 @@ suite('Stable cell editing', () => {
         ]);
     });
 
+    test('preserves exact 64-bit rowid and INTEGER PRIMARY KEY identities', async () => {
+        createDatabase(`
+            CREATE TABLE integer_keys (id INTEGER PRIMARY KEY, value TEXT);
+            INSERT INTO integer_keys VALUES (9223372036854775806, 'integer-key');
+            CREATE TABLE rowid_keys (value TEXT);
+            INSERT INTO rowid_keys(rowid, value) VALUES (9223372036854775805, 'rowid-key');
+        `);
+        await service.openDatabase(databasePath);
+
+        const integerRows = await service.getTableData('integer_keys');
+        assert.strictEqual(integerRows.rowIdentities[0]?.parts[0].value, '9223372036854775806');
+        await service.updateCellData('integer_keys', integerRows.rowIdentities[0]!, 'value', 'updated-integer-key');
+
+        const rowidRows = await service.getTableData('rowid_keys');
+        assert.strictEqual(rowidRows.rowIdentities[0]?.parts[0].value, '9223372036854775805');
+        await service.updateCellData('rowid_keys', rowidRows.rowIdentities[0]!, 'value', 'updated-rowid-key');
+
+        service.closeDatabase();
+        assert.deepStrictEqual(
+            readRows('SELECT CAST(id AS TEXT) AS id, value FROM integer_keys'),
+            [{ id: '9223372036854775806', value: 'updated-integer-key' }]
+        );
+        assert.deepStrictEqual(
+            readRows('SELECT CAST(rowid AS TEXT) AS rowid, value FROM rowid_keys'),
+            [{ rowid: '9223372036854775805', value: 'updated-rowid-key' }]
+        );
+    });
+
+    test('restores committed in-memory state when persistence fails', async () => {
+        createDatabase(`
+            CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT);
+            INSERT INTO records VALUES (1, 'original');
+        `);
+        await service.openDatabase(databasePath);
+        const data = await service.getTableData('records');
+        (service as any).saveChangesToFile = async () => {
+            throw new Error('forced persistence failure');
+        };
+
+        await assert.rejects(
+            service.updateCellData('records', data.rowIdentities[0]!, 'value', 'must-not-stick'),
+            /forced persistence failure/
+        );
+
+        const afterFailure = await service.getTableData('records');
+        assert.strictEqual(afterFailure.values[0][1], 'original');
+        assert.deepStrictEqual(readRows('SELECT id, value FROM records'), [{ id: 1, value: 'original' }]);
+    });
+
+    test('serializes persistence for concurrent cell edits', async () => {
+        createDatabase(`
+            CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT);
+            INSERT INTO records VALUES (1, 'one'), (2, 'two');
+        `);
+        await service.openDatabase(databasePath);
+        const data = await service.getTableData('records');
+        const saveChangesToFile = (service as any).saveChangesToFile.bind(service);
+        let activeSaves = 0;
+        let maxActiveSaves = 0;
+        (service as any).saveChangesToFile = async () => {
+            activeSaves++;
+            maxActiveSaves = Math.max(maxActiveSaves, activeSaves);
+            await new Promise(resolve => setTimeout(resolve, 10));
+            try {
+                await saveChangesToFile();
+            } finally {
+                activeSaves--;
+            }
+        };
+
+        await Promise.all([
+            service.updateCellData('records', identityFor(data, 'id', 1), 'value', 'updated-one'),
+            service.updateCellData('records', identityFor(data, 'id', 2), 'value', 'updated-two')
+        ]);
+
+        assert.strictEqual(maxActiveSaves, 1);
+        assert.deepStrictEqual(readRows('SELECT id, value FROM records ORDER BY id'), [
+            { id: 1, value: 'updated-one' },
+            { id: 2, value: 'updated-two' }
+        ]);
+    });
+
     test('rejects stale, ambiguous, and unavailable row identities without persisting changes', async () => {
         createDatabase(`
             CREATE TABLE ambiguous (a TEXT, b TEXT, value TEXT, PRIMARY KEY (a, b));

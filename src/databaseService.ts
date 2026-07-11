@@ -43,9 +43,11 @@ export interface QueryResult {
     values: any[][];
 }
 
+export type SQLiteValue = number | string | Uint8Array | null;
+
 export interface RowIdentityPart {
     column: string;
-    value: any;
+    value: SQLiteValue;
 }
 
 export interface RowIdentity {
@@ -62,7 +64,7 @@ export interface EditableTableData extends QueryResult {
 export interface CellUpdateResult {
     changes: number;
     identity: RowIdentity;
-    value: any;
+    value: SQLiteValue;
 }
 
 interface TableIdentityDefinition {
@@ -92,6 +94,7 @@ export class DatabaseService {
     private tempDecryptedPath: string | null = null;
     private currentDatabasePath: string | null = null;
     private currentEncryptionKey: string | null = null;
+    private editQueue: Promise<void> = Promise.resolve();
     private isDevelopment = process.env.NODE_ENV === 'development' || (typeof process !== 'undefined' && process.env.VSCODE_PID !== undefined);
 
     private debugLog(component: string, message: string, ...args: any[]): void {
@@ -114,6 +117,25 @@ export class DatabaseService {
 
     private quoteIdentifier(identifier: string): string {
         return `"${identifier.replace(/"/g, '""')}"`;
+    }
+
+    private serializeIdentityValue(value: unknown): SQLiteValue {
+        if (typeof value === 'bigint') {
+            return value.toString();
+        }
+        if (value === null || typeof value === 'string' || value instanceof Uint8Array) {
+            return value;
+        }
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return value;
+        }
+        throw new Error('Row identity contains an unsupported SQLite value.');
+    }
+
+    private enqueueEdit<T>(operation: () => Promise<T>): Promise<T> {
+        const queued = this.editQueue.then(operation, operation);
+        this.editQueue = queued.then(() => undefined, () => undefined);
+        return queued;
     }
 
     private getSettings() {
@@ -611,8 +633,10 @@ export class DatabaseService {
 
         let columns = stmt.getColumnNames();
         const rawRows: any[][] = [];
+        const identityRows: Array<Array<SQLiteValue | bigint>> = [];
         while (stmt.step()) {
             rawRows.push(stmt.get());
+            identityRows.push(stmt.get(null, { useBigInt: true }));
         }
         stmt.free();
 
@@ -621,14 +645,14 @@ export class DatabaseService {
         }
 
         const values = hiddenIdentity ? rawRows.map(row => row.slice(1)) : rawRows;
-        const rowIdentities: Array<RowIdentity | null> = rawRows.map(row => {
+        const rowIdentities: Array<RowIdentity | null> = identityRows.map(row => {
             if (!definition) {
                 return null;
             }
             if (definition.kind === 'rowid') {
                 return {
                     kind: 'rowid',
-                    parts: [{ column: definition.columns[0], value: row[0] }]
+                    parts: [{ column: definition.columns[0], value: this.serializeIdentityValue(row[0]) }]
                 };
             }
 
@@ -639,7 +663,7 @@ export class DatabaseService {
                     if (columnIndex < 0) {
                         throw new Error(`Primary-key column ${column} is missing from the table result.`);
                     }
-                    return { column, value: row[columnIndex] };
+                    return { column, value: this.serializeIdentityValue(row[columnIndex]) };
                 })
             };
         });
@@ -653,20 +677,34 @@ export class DatabaseService {
         };
     }
 
-    private processEditedValue(newValue: any): any {
+    private processEditedValue(newValue: unknown): SQLiteValue {
         if (newValue === '' || newValue === null) {
             return null;
         }
         if (typeof newValue === 'string') {
             const numValue = Number(newValue);
             if (Number.isFinite(numValue) && newValue.trim() !== '' && newValue.trim() === String(numValue)) {
+                if (Number.isInteger(numValue) && !Number.isSafeInteger(numValue)) {
+                    return newValue;
+                }
                 return numValue;
             }
+            return newValue;
         }
-        return newValue;
+        if (typeof newValue === 'number' && Number.isFinite(newValue)) {
+            return newValue;
+        }
+        if (newValue instanceof Uint8Array) {
+            return newValue;
+        }
+        throw new Error('The edited value is not a supported SQLite value.');
     }
 
-    async updateCellData(tableName: string, identity: RowIdentity, columnName: string, newValue: any): Promise<CellUpdateResult> {
+    async updateCellData(tableName: string, identity: RowIdentity, columnName: string, newValue: unknown): Promise<CellUpdateResult> {
+        return this.enqueueEdit(() => this.updateCellDataSerialized(tableName, identity, columnName, newValue));
+    }
+
+    private async updateCellDataSerialized(tableName: string, identity: RowIdentity, columnName: string, newValue: unknown): Promise<CellUpdateResult> {
         if (!this.db) {
             throw new Error('Database not opened');
         }
@@ -701,8 +739,15 @@ export class DatabaseService {
         const parameters = [processedValue, ...identity.parts.map(part => part.value)];
         let stmt: any = null;
         let transactionOpen = false;
+        let committed = false;
+        let databaseStateBeforeUpdate: Uint8Array | undefined;
+        let fileStateBeforeUpdate: Buffer | undefined;
 
         try {
+            databaseStateBeforeUpdate = this.db.export();
+            if (this.currentDatabasePath) {
+                fileStateBeforeUpdate = fs.readFileSync(this.currentDatabasePath);
+            }
             this.db.run('BEGIN IMMEDIATE TRANSACTION');
             transactionOpen = true;
             stmt = this.db.prepare(updateQuery);
@@ -720,6 +765,7 @@ export class DatabaseService {
 
             this.db.run('COMMIT');
             transactionOpen = false;
+            committed = true;
 
             const nextIdentity: RowIdentity = {
                 kind: identity.kind,
@@ -743,14 +789,37 @@ export class DatabaseService {
             if (stmt) {
                 stmt.free();
             }
+            let restoreSnapshot = committed;
             if (transactionOpen) {
                 try {
                     this.db.run('ROLLBACK');
                 } catch {
-                    // Preserve the original update failure.
+                    restoreSnapshot = true;
+                } finally {
+                    transactionOpen = false;
+                }
+            }
+            if (restoreSnapshot && databaseStateBeforeUpdate) {
+                try {
+                    this.restoreDatabaseState(databaseStateBeforeUpdate, fileStateBeforeUpdate);
+                } catch (restoreError) {
+                    throw new Error(`Failed to update cell: ${error}. Failed to restore the previous database state: ${restoreError}`);
                 }
             }
             throw new Error(`Failed to update cell: ${error}`);
+        }
+    }
+
+    private restoreDatabaseState(databaseState: Uint8Array, fileState?: Buffer): void {
+        const modifiedDatabase = this.db;
+        this.db = new this.SQL.Database(databaseState);
+        modifiedDatabase?.close();
+
+        if (this.currentDatabasePath && fileState) {
+            fs.writeFileSync(this.currentDatabasePath, fileState);
+        }
+        if (this.tempDecryptedPath) {
+            fs.writeFileSync(this.tempDecryptedPath, Buffer.from(databaseState));
         }
     }
 

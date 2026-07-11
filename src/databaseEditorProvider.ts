@@ -6,12 +6,21 @@ import { DatabaseWatcher } from './databaseWatcher';
 import type { ExtensionToWebviewMessage, WebviewSettingsPayload } from './webviewMessages';
 import { isWebviewToExtensionMessage } from './webviewMessages';
 
+interface TableSyncState {
+    table: string;
+    since: string;
+    page: number;
+    pageSize: number;
+    key?: string;
+    lastPageData?: any[][];
+}
+
 export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvider {
     public static readonly viewType = 'sqlite-intelliview-vscode.databaseEditor';
     private static activeProvider: DatabaseEditorProvider | undefined;
     private activeConnections: Map<string, DatabaseService> = new Map();
     /** Track last sync state per database for delta updates */
-    private lastSync: Map<string, { table: string; since: string; page: number; pageSize: number; key?: string; lastPageData?: any[][] }> = new Map();
+    private lastSync: Map<string, TableSyncState> = new Map();
     private databaseWatcher: DatabaseWatcher = new DatabaseWatcher();
     private webviewPanels: Map<string, vscode.WebviewPanel> = new Map();
     /** cache full pages keyed by `${db}:${table}:${page}:${pageSize}` → QueryResult.values */
@@ -206,7 +215,7 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 return;
             }
 
-            this.debugLog('onDidReceiveMessage', `Received message type: ${e.type}`, e);
+            this.debugLog('onDidReceiveMessage', `Received message type: ${e.type}`);
             
             switch (e.type) {
                 case 'requestDatabaseInfo':
@@ -722,7 +731,12 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                     key,
                     lastPageData: result.values // <--- store the actual rows
                 });
-                this.debugLog('getTableDataPaginated', 'lastSync set for', databasePath, { table: tableName, page, pageSize, lastPageData: result.values });
+                this.debugLog('getTableDataPaginated', 'lastSync set for', databasePath, {
+                    table: tableName,
+                    page,
+                    pageSize,
+                    rowCount: result.values.length
+                });
             }
         } catch (error) {
             this.postWebviewMessage(webviewPanel.webview, {
@@ -732,7 +746,7 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
         }
     }
 
-    private async handleCellUpdateRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, requestId: string, rowIdentity: RowIdentity, columnName: string, newValue: any, key?: string) {
+    private async handleCellUpdateRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, requestId: string, rowIdentity: RowIdentity, columnName: string, newValue: unknown, key?: string) {
         try {
             const dbService = await this.getOrCreateConnection(databasePath, key);
             const updateResult = await dbService.updateCellData(tableName, rowIdentity, columnName, newValue);
@@ -1089,50 +1103,71 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
     }
 
     public async handleExternalDatabaseChange(databasePath: string) {
-        // External changes can modify data and schema; clear all cached metadata/counts for this DB.
-        this.invalidateCachesForDatabase(databasePath);
+        let panel: vscode.WebviewPanel | undefined;
+        let sync: TableSyncState | undefined;
 
-        this.closeConnection(databasePath);
-        const panel = this.webviewPanels.get(databasePath);
-        const sync = this.lastSync.get(databasePath);
-        this.debugLog('DatabaseChange', `[handleExternalDatabaseChange] Triggered for ${databasePath}`, { hasPanel: !!panel, hasSync: !!sync });
-        if (!panel || !sync) {
-            this.debugWarn('DatabaseChange', `[handleExternalDatabaseChange] No panel or sync found for ${databasePath}`, { hasPanel: !!panel, hasSync: !!sync });
-            return;
+        try {
+            panel = this.webviewPanels.get(databasePath);
+            sync = this.lastSync.get(databasePath);
+            // External changes can modify data and schema; clear all cached metadata/counts for this DB.
+            this.invalidateCachesForDatabase(databasePath);
+            this.closeConnection(databasePath);
+            this.debugLog('DatabaseChange', `[handleExternalDatabaseChange] Triggered for ${databasePath}`, { hasPanel: !!panel, hasSync: !!sync });
+            if (!panel || !sync) {
+                this.debugWarn('DatabaseChange', `[handleExternalDatabaseChange] No panel or sync found for ${databasePath}`, { hasPanel: !!panel, hasSync: !!sync });
+                return;
+            }
+
+            const { table, page, pageSize, key } = sync;
+            this.debugLog('DatabaseChange', '[handleExternalDatabaseChange] Using sync state', { table, page, pageSize });
+            const db = await this.getOrCreateConnection(databasePath, key);
+            const newResult = await db.getTableDataPaginated(table, page, pageSize);
+            const newTotalCount = await db.getRowCount(table);
+            this.rowCountCache.set(this.getTableCacheKey(databasePath, table), newTotalCount);
+            this.debugLog('DatabaseChange', 'New page data fetched', { rowCount: newResult.values.length, newTotalCount });
+            const [foreignKeys, columnInfo] = await Promise.all([
+                db.getForeignKeys(table),
+                db.getTableInfo(table)
+            ]);
+            await this.postWebviewMessage(panel.webview, {
+                type: 'tableData',
+                success: true,
+                tableName: table,
+                data: newResult.values,
+                columns: newResult.columns,
+                rowIdentities: newResult.rowIdentities,
+                editable: newResult.editable,
+                editError: newResult.editError,
+                foreignKeys,
+                columnInfo,
+                page,
+                pageSize,
+                totalRows: newTotalCount,
+                totalRowsKnown: true
+            });
+            sync.lastPageData = newResult.values;
+            this.lastSync.set(databasePath, sync);
+            this.debugLog('DatabaseChange', 'lastPageData updated in lastSync', {
+                databasePath,
+                rowCount: sync.lastPageData.length
+            });
+        } catch (error) {
+            if (sync) {
+                sync.lastPageData = undefined;
+                this.lastSync.set(databasePath, sync);
+            }
+            this.debugError('DatabaseChange', `Failed to refresh ${databasePath}:`, error);
+            if (panel) {
+                try {
+                    await this.postWebviewMessage(panel.webview, {
+                        type: 'error',
+                        message: `Failed to refresh database: ${error}`
+                    });
+                } catch (notificationError) {
+                    this.debugWarn('DatabaseChange', 'Failed to notify webview about refresh failure:', notificationError);
+                }
+            }
         }
-        const { table, page, pageSize, key } = sync;
-        this.debugLog('DatabaseChange', '[handleExternalDatabaseChange] Using sync state', { table, page, pageSize });
-        const db = await this.getOrCreateConnection(databasePath, key);
-        const newResult = await db.getTableDataPaginated(table, page, pageSize);
-        const newTotalCount = await db.getRowCount(table);
-        this.rowCountCache.set(this.getTableCacheKey(databasePath, table), newTotalCount);
-        this.debugLog('DatabaseChange', 'New page data fetched', { rowCount: newResult.values.length, newTotalCount });
-        const [foreignKeys, columnInfo] = await Promise.all([
-            db.getForeignKeys(table),
-            db.getTableInfo(table)
-        ]);
-        this.postWebviewMessage(panel.webview, {
-            type: 'tableData',
-            success: true,
-            tableName: table,
-            data: newResult.values,
-            columns: newResult.columns,
-            rowIdentities: newResult.rowIdentities,
-            editable: newResult.editable,
-            editError: newResult.editError,
-            foreignKeys,
-            columnInfo,
-            page,
-            pageSize,
-            totalRows: newTotalCount,
-            totalRowsKnown: true
-        });
-        sync.lastPageData = newResult.values;
-        this.lastSync.set(databasePath, sync);
-        this.debugLog('DatabaseChange', 'lastPageData updated in lastSync', {
-            databasePath,
-            rowCount: sync.lastPageData.length
-        });
     }
 }
 

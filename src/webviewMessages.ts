@@ -168,6 +168,15 @@ function hasDefinedProperty(value: Record<string, unknown>, key: string): boolea
     return Object.prototype.hasOwnProperty.call(value, key) && value[key] !== undefined;
 }
 
+function isSQLiteValue(value: unknown): boolean {
+    return (
+        value === null ||
+        typeof value === 'string' ||
+        (typeof value === 'number' && Number.isFinite(value)) ||
+        value instanceof Uint8Array
+    );
+}
+
 function isRowIdentity(value: unknown): value is RowIdentity {
     if (!isRecord(value) || (value.kind !== 'primaryKey' && value.kind !== 'rowid') || !Array.isArray(value.parts)) {
         return false;
@@ -178,7 +187,8 @@ function isRowIdentity(value: unknown): value is RowIdentity {
     return value.parts.every(part => (
         isRecord(part) &&
         isString(part.column) &&
-        hasDefinedProperty(part, 'value')
+        hasDefinedProperty(part, 'value') &&
+        isSQLiteValue(part.value)
     ));
 }
 
