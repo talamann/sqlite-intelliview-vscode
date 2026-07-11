@@ -346,6 +346,29 @@ suite('Stable cell editing', () => {
         assert.deepStrictEqual(readRows('SELECT id, value FROM records'), [{ id: 1, value: 'original' }]);
     });
 
+    test('restores deleted rows in memory and on disk when persistence fails', async () => {
+        createDatabase(`
+            CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT);
+            INSERT INTO records VALUES (1, 'original');
+        `);
+        await service.openDatabase(databasePath);
+        const saveChangesToFile = (service as any).saveChangesToFile.bind(service);
+        (service as any).saveChangesToFile = async (databaseState?: Uint8Array) => {
+            assert.ok(databaseState instanceof Uint8Array);
+            await saveChangesToFile(databaseState);
+            throw new Error('forced delete persistence failure');
+        };
+
+        await assert.rejects(
+            service.deleteRow('records', { column: 'id', value: 1 }),
+            /forced delete persistence failure/
+        );
+
+        const afterFailure = await service.getTableData('records');
+        assert.deepStrictEqual(afterFailure.values, [[1, 'original']]);
+        assert.deepStrictEqual(readRows('SELECT id, value FROM records'), [{ id: 1, value: 'original' }]);
+    });
+
     test('serializes persistence for concurrent updates and deletes', async () => {
         createDatabase(`
             CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT);
@@ -356,12 +379,12 @@ suite('Stable cell editing', () => {
         const saveChangesToFile = (service as any).saveChangesToFile.bind(service);
         let activeSaves = 0;
         let maxActiveSaves = 0;
-        (service as any).saveChangesToFile = async () => {
+        (service as any).saveChangesToFile = async (databaseState?: Uint8Array) => {
             activeSaves++;
             maxActiveSaves = Math.max(maxActiveSaves, activeSaves);
             await new Promise(resolve => setTimeout(resolve, 10));
             try {
-                await saveChangesToFile();
+                await saveChangesToFile(databaseState);
             } finally {
                 activeSaves--;
             }

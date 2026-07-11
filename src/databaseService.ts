@@ -767,10 +767,6 @@ export class DatabaseService {
         let fileStateBeforeUpdate: Buffer | undefined;
 
         try {
-            databaseStateBeforeUpdate = this.db.export();
-            if (this.currentDatabasePath) {
-                fileStateBeforeUpdate = fs.readFileSync(this.currentDatabasePath);
-            }
             this.db.run('BEGIN IMMEDIATE TRANSACTION');
             transactionOpen = true;
             stmt = this.db.prepare(updateQuery);
@@ -786,6 +782,7 @@ export class DatabaseService {
                 throw new Error(`Critical update failure: expected one changed row but SQLite reported ${changes}. The update was rolled back.`);
             }
 
+            ({ databaseState: databaseStateBeforeUpdate, fileState: fileStateBeforeUpdate } = this.capturePersistenceSnapshot());
             this.db.run('COMMIT');
             transactionOpen = false;
             committed = true;
@@ -798,7 +795,8 @@ export class DatabaseService {
                 }))
             };
 
-            await this.saveChangesToFile();
+            const databaseStateAfterUpdate = this.db.export();
+            await this.saveChangesToFile(databaseStateAfterUpdate);
             persistenceComplete = true;
             if (this.currentDatabasePath) {
                 markInternalUpdate(this.currentDatabasePath);
@@ -823,6 +821,9 @@ export class DatabaseService {
                     transactionOpen = false;
                 }
             }
+            if (restoreSnapshot && !databaseStateBeforeUpdate) {
+                ({ databaseState: databaseStateBeforeUpdate, fileState: fileStateBeforeUpdate } = this.capturePersistenceSnapshot());
+            }
             if (restoreSnapshot && databaseStateBeforeUpdate) {
                 try {
                     this.restoreDatabaseState(databaseStateBeforeUpdate, fileStateBeforeUpdate);
@@ -832,6 +833,18 @@ export class DatabaseService {
             }
             throw new Error(`Failed to update cell: ${error}`);
         }
+    }
+
+    private capturePersistenceSnapshot(): { databaseState: Uint8Array; fileState: Buffer } {
+        if (!this.currentDatabasePath) {
+            throw new Error('No database path available for saving');
+        }
+
+        const fileState = fs.readFileSync(this.currentDatabasePath);
+        const databaseState = this.tempDecryptedPath
+            ? fs.readFileSync(this.tempDecryptedPath)
+            : fileState;
+        return { databaseState, fileState };
     }
 
     private restoreDatabaseState(databaseState: Uint8Array, fileState?: Buffer): void {
@@ -863,6 +876,13 @@ export class DatabaseService {
 
         // Sanitize table name
         const sanitizedTableName = tableName.replace(/"/g, '""');
+        let stmt: any = null;
+        let countStmt: any = null;
+        let transactionOpen = false;
+        let committed = false;
+        let persistenceComplete = false;
+        let databaseStateBeforeDelete: Uint8Array | undefined;
+        let fileStateBeforeDelete: Buffer | undefined;
         
         try {
             let deleteQuery: string;
@@ -902,24 +922,34 @@ export class DatabaseService {
             
             this.debugLog('DeleteRow', 'Executing query:', deleteQuery);
             this.debugLog('DeleteRow', 'Parameters:', parameters);
-            
-            const stmt = this.db.prepare(deleteQuery);
+
+            this.db.run('BEGIN IMMEDIATE TRANSACTION');
+            transactionOpen = true;
+            stmt = this.db.prepare(deleteQuery);
             stmt.run(parameters);
             stmt.free();
+            stmt = null;
             
             this.debugLog('DeleteRow', 'Delete query executed successfully');
             
             // Verify the deletion by checking row count
             const countQuery = `SELECT COUNT(*) as count FROM "${sanitizedTableName}"`;
-            const countStmt = this.db.prepare(countQuery);
+            countStmt = this.db.prepare(countQuery);
             const countResult = countStmt.step();
             const rowCount = countResult ? countStmt.get()[0] : 0;
             countStmt.free();
+            countStmt = null;
             
             this.debugLog('DeleteRow', `Rows remaining in table: ${rowCount}`);
             
-            // CRITICAL: Save changes back to the database file
-            await this.saveChangesToFile();
+            ({ databaseState: databaseStateBeforeDelete, fileState: fileStateBeforeDelete } = this.capturePersistenceSnapshot());
+            this.db.run('COMMIT');
+            transactionOpen = false;
+            committed = true;
+
+            const databaseStateAfterDelete = this.db.export();
+            await this.saveChangesToFile(databaseStateAfterDelete);
+            persistenceComplete = true;
             // Mark as internal update so watcher ignores this event
             if (this.currentDatabasePath) {
                 markInternalUpdate(this.currentDatabasePath);
@@ -928,6 +958,28 @@ export class DatabaseService {
             this.debugLog('DeleteRow', 'Row deletion completed successfully');
             
         } catch (error) {
+            stmt?.free();
+            countStmt?.free();
+            let restoreSnapshot = committed && !persistenceComplete;
+            if (transactionOpen) {
+                try {
+                    this.db.run('ROLLBACK');
+                } catch {
+                    restoreSnapshot = true;
+                } finally {
+                    transactionOpen = false;
+                }
+            }
+            if (restoreSnapshot && !databaseStateBeforeDelete) {
+                ({ databaseState: databaseStateBeforeDelete, fileState: fileStateBeforeDelete } = this.capturePersistenceSnapshot());
+            }
+            if (restoreSnapshot && databaseStateBeforeDelete) {
+                try {
+                    this.restoreDatabaseState(databaseStateBeforeDelete, fileStateBeforeDelete);
+                } catch (restoreError) {
+                    throw new Error(`Failed to delete row: ${error}. Failed to restore the previous database state: ${restoreError}`);
+                }
+            }
             this.debugError('DeleteRow', 'Failed to delete row:', error);
             throw new Error(`Failed to delete row: ${error}`);
         }
@@ -936,7 +988,7 @@ export class DatabaseService {
     /**
      * Save changes from the in-memory database back to the file
      */
-    private async saveChangesToFile(): Promise<void> {
+    private async saveChangesToFile(databaseState?: Uint8Array): Promise<void> {
         if (!this.db) {
             throw new Error('Database not opened');
         }
@@ -946,8 +998,8 @@ export class DatabaseService {
         this.debugLog('SaveFile', `Temp decrypted path: ${this.tempDecryptedPath}`);
 
         try {
-            // Export the current database state
-            const data = this.db.export();
+            // Reuse the caller's committed export when available.
+            const data = databaseState ?? this.db.export();
             const buffer = Buffer.from(data);
             
             this.debugLog('SaveFile', `Exported ${buffer.length} bytes`);
