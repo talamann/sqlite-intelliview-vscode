@@ -121,7 +121,8 @@ export class DatabaseService {
 
     private serializeIdentityValue(value: unknown): SQLiteValue {
         if (typeof value === 'bigint') {
-            return value.toString();
+            const numericValue = Number(value);
+            return Number.isSafeInteger(numericValue) ? numericValue : value.toString();
         }
         if (value === null || typeof value === 'string' || value instanceof Uint8Array) {
             return value;

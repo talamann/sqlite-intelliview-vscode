@@ -157,6 +157,7 @@ suite('Stable cell editing', () => {
         const secondPage = await service.getTableDataPaginated('notes', 2, 2);
 
         assert.strictEqual(secondPage.rowIdentities[0]?.kind, 'rowid');
+        assert.strictEqual(secondPage.rowIdentities[0]?.parts[0].value, 3);
         assert.deepStrictEqual(secondPage.values.map(row => row[0]), ['three', 'four']);
         await service.updateCellData('notes', secondPage.rowIdentities[0]!, 'value', 'page-two-first');
 
