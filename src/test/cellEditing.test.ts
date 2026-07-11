@@ -170,6 +170,24 @@ suite('Stable cell editing', () => {
         ]);
     });
 
+    test('paginates deterministically by the stable row identity', async () => {
+        createDatabase(`
+            CREATE TABLE ordered_records (code TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO ordered_records VALUES ('charlie', 'C'), ('alpha', 'A'), ('bravo', 'B');
+        `);
+        await service.openDatabase(databasePath);
+
+        const firstPage = await service.getTableDataPaginated('ordered_records', 1, 2);
+        const secondPage = await service.getTableDataPaginated('ordered_records', 2, 2);
+
+        assert.deepStrictEqual(firstPage.values.map(row => row[0]), ['alpha', 'bravo']);
+        assert.deepStrictEqual(secondPage.values.map(row => row[0]), ['charlie']);
+        assert.deepStrictEqual(
+            firstPage.rowIdentities.map(identity => identity?.parts[0].value),
+            ['alpha', 'bravo']
+        );
+    });
+
     test('supports text and composite primary keys, WITHOUT ROWID, and primary-key edits', async () => {
         createDatabase(`
             CREATE TABLE text_keys (code TEXT PRIMARY KEY, value TEXT);
@@ -285,10 +303,10 @@ suite('Stable cell editing', () => {
         assert.deepStrictEqual(readRows('SELECT id, value FROM records'), [{ id: 1, value: 'original' }]);
     });
 
-    test('serializes persistence for concurrent cell edits', async () => {
+    test('serializes persistence for concurrent updates and deletes', async () => {
         createDatabase(`
             CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT);
-            INSERT INTO records VALUES (1, 'one'), (2, 'two');
+            INSERT INTO records VALUES (1, 'one'), (2, 'two'), (3, 'three');
         `);
         await service.openDatabase(databasePath);
         const data = await service.getTableData('records');
@@ -308,7 +326,8 @@ suite('Stable cell editing', () => {
 
         await Promise.all([
             service.updateCellData('records', identityFor(data, 'id', 1), 'value', 'updated-one'),
-            service.updateCellData('records', identityFor(data, 'id', 2), 'value', 'updated-two')
+            service.updateCellData('records', identityFor(data, 'id', 2), 'value', 'updated-two'),
+            service.deleteRow('records', { column: 'id', value: 3 })
         ]);
 
         assert.strictEqual(maxActiveSaves, 1);

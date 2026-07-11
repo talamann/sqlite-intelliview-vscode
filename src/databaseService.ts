@@ -627,7 +627,10 @@ export class DatabaseService {
         const identitySelection = hiddenIdentity
             ? `${this.quoteIdentifier(definition.columns[0])} AS ${this.quoteIdentifier('__intelliview_row_identity__')}, `
             : '';
-        const query = `SELECT ${identitySelection}* FROM ${this.quoteIdentifier(tableName)} LIMIT ? OFFSET ?`;
+        const identityOrder = definition
+            ? ` ORDER BY ${definition.columns.map(column => this.quoteIdentifier(column)).join(', ')}`
+            : '';
+        const query = `SELECT ${identitySelection}* FROM ${this.quoteIdentifier(tableName)}${identityOrder} LIMIT ? OFFSET ?`;
         const stmt = this.db.prepare(query);
         stmt.bind([safeLimit, safeOffset]);
 
@@ -635,8 +638,9 @@ export class DatabaseService {
         const rawRows: any[][] = [];
         const identityRows: Array<Array<SQLiteValue | bigint>> = [];
         while (stmt.step()) {
-            rawRows.push(stmt.get());
-            identityRows.push(stmt.get(null, { useBigInt: true }));
+            const identityRow = stmt.get(null, { useBigInt: true }) as Array<SQLiteValue | bigint>;
+            identityRows.push(identityRow);
+            rawRows.push(identityRow.map(value => typeof value === 'bigint' ? Number(value) : value));
         }
         stmt.free();
 
@@ -740,6 +744,7 @@ export class DatabaseService {
         let stmt: any = null;
         let transactionOpen = false;
         let committed = false;
+        let persistenceComplete = false;
         let databaseStateBeforeUpdate: Uint8Array | undefined;
         let fileStateBeforeUpdate: Buffer | undefined;
 
@@ -776,6 +781,7 @@ export class DatabaseService {
             };
 
             await this.saveChangesToFile();
+            persistenceComplete = true;
             if (this.currentDatabasePath) {
                 markInternalUpdate(this.currentDatabasePath);
             }
@@ -789,7 +795,7 @@ export class DatabaseService {
             if (stmt) {
                 stmt.free();
             }
-            let restoreSnapshot = committed;
+            let restoreSnapshot = committed && !persistenceComplete;
             if (transactionOpen) {
                 try {
                     this.db.run('ROLLBACK');
@@ -824,6 +830,10 @@ export class DatabaseService {
     }
 
     async deleteRow(tableName: string, rowIdentifier: any): Promise<void> {
+        return this.enqueueEdit(() => this.deleteRowSerialized(tableName, rowIdentifier));
+    }
+
+    private async deleteRowSerialized(tableName: string, rowIdentifier: any): Promise<void> {
         if (!this.db) {
             throw new Error('Database not opened');
         }
@@ -986,8 +996,12 @@ export class DatabaseService {
             // Replace the original file with the new encrypted version
             fs.copyFileSync(tempEncryptedFile, originalPath);
             
-            // Clean up temporary encrypted file
-            fs.unlinkSync(tempEncryptedFile);
+            // Cleanup failure does not invalidate the successfully replaced database.
+            try {
+                fs.unlinkSync(tempEncryptedFile);
+            } catch (error) {
+                this.debugWarn('ReEncrypt', `Failed to remove temporary encrypted file ${tempEncryptedFile}:`, error);
+            }
             
             this.debugLog('ReEncrypt', 'Database re-encrypted successfully');
             
