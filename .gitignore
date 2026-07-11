@@ -6,13 +6,37 @@ node_modules
 
 # Test databases and files
 test*.db
+test*.db3
+test*.s3db
+test*.sl3
 test*.sqlite
+test*.sqlite3
 test*.sqlite-shm
 test*.sqlite-wal
+test*.sqlite3-shm
+test*.sqlite3-wal
+test*.db3-shm
+test*.db3-wal
+test*.s3db-shm
+test*.s3db-wal
+test*.sl3-shm
+test*.sl3-wal
 example*.db
+example*.db3
+example*.s3db
+example*.sl3
 example*.sqlite
+example*.sqlite3
 example*.sqlite-shm
 example*.sqlite-wal
+example*.sqlite3-shm
+example*.sqlite3-wal
+example*.db3-shm
+example*.db3-wal
+example*.s3db-shm
+example*.s3db-wal
+example*.sl3-shm
+example*.sl3-wal
 *.sql
 test_*.js
 generate_*.js

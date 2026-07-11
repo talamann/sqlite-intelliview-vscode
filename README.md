@@ -72,7 +72,7 @@ A quick tour of the main workflows (all offline, inside VS Code):
 
 - **Free**: no paywalls; MIT-licensed.
 - **Offline + secure by design**: database contents stay on your machine (the extension doesn’t make network requests).
-- **Custom database editor** for `.db`, `.sqlite`, `.sqlite3` (opens as a rich UI, not plain text).
+- **Custom database editor** for `.sqlite`, `.sqlite3`, `.db`, `.db3`, `.s3db`, and `.sl3` (opens as a rich UI, not plain text).
 - **Database Explorer view** (tables + columns) while a database is open.
 - **Multi-table tabs** (open multiple tables/results, drag to reorder).
 - **Fast table browsing**: pagination, quick search, sorting, column filters, resizable columns/rows, column pinning.
@@ -85,7 +85,7 @@ A quick tour of the main workflows (all offline, inside VS Code):
 
 ## Quick Start
 
-1. Open any `.db`, `.sqlite`, or `.sqlite3` file.
+1. Open any `.sqlite`, `.sqlite3`, `.db`, `.db3`, `.s3db`, or `.sl3` file.
 2. If VS Code asks, choose **Open With… → SQLite Database IntelliView**.
 3. Use the left **Database Explorer** to open tables, then:
    - **Data** tab: browse/edit rows
@@ -147,9 +147,22 @@ If the database is locked by another process (or you only have read-only access)
 
 For best results, ensure the `sqlite3` CLI is available on your `PATH` (used for WAL checkpointing on unencrypted databases).
 
-## Settings (WAL + Refresh)
+## Settings
 
-These VS Code settings control WAL behavior and external refresh noise:
+SQLite IntelliView recognizes `.sqlite`, `.sqlite3`, `.db`, `.db3`, `.s3db`, and `.sl3` files by default. Add other extensions with `sqliteIntelliView.additionalFileExtensions`. Values may include a leading dot, are matched case-insensitively, and invalid or duplicate entries are ignored:
+
+```json
+{
+  "sqliteIntelliView.additionalFileExtensions": [
+    ".database",
+    "sqlite-backup"
+  ]
+}
+```
+
+The additional extensions are available immediately in SQLite IntelliView's open dialogs and commands. VS Code custom editor associations, activation events, and Explorer context-menu visibility are static `package.json` contributions, so they cannot be changed dynamically from this setting. To open a custom-extension file, run **SQLite IntelliView: Open SQLite Database** and select it.
+
+These settings control WAL behavior and external refresh noise:
 
 - `sqliteIntelliView.walCheckpointMode` (`"full" | "passive" | "off"`, default: `"full"`): controls how WAL checkpointing runs when opening a database with a `-wal` file.
   - `full`: more aggressive checkpoint (best chance of up-to-date data).
