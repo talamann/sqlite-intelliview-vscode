@@ -78,7 +78,7 @@ suite('Stable cell editing', () => {
         `);
 
         const disk = new SQL.Database(fs.readFileSync(databasePath));
-        const rowidStatement = disk.prepare('SELECT rowid FROM records LIMIT 1 OFFSET ?');
+        const rowidStatement = disk.prepare('SELECT rowid FROM records ORDER BY rowid LIMIT 1 OFFSET ?');
         const idStatement = disk.prepare('SELECT Id FROM records WHERE rowid = ?');
         const oldOffsetTargets = [1, 5].map(offset => {
             const rowid = rowidStatement.get([offset])[0];
