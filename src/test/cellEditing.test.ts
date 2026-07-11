@@ -133,7 +133,8 @@ suite('Stable cell editing', () => {
         await service.updateCellData('records', middleId5.identity, 'value', 'filtered-five');
 
         const virtualOrder = [3, 0, 2, 1];
-        const virtualVisibleRow = pairedRows[virtualOrder[2]];
+        const virtualRows = virtualOrder.map(sourceIndex => pairedRows[sourceIndex]);
+        const virtualVisibleRow = virtualRows[2];
         assert.strictEqual(virtualVisibleRow.row[0], 40);
         assert.ok(virtualVisibleRow.identity);
         await service.updateCellData('records', virtualVisibleRow.identity, 'value', 'virtual-forty');
@@ -186,6 +187,25 @@ suite('Stable cell editing', () => {
             firstPage.rowIdentities.map(identity => identity?.parts[0].value),
             ['alpha', 'bravo']
         );
+    });
+
+    test('caps read limits and falls back for unsafe integer limits', async () => {
+        createDatabase(`
+            CREATE TABLE many_rows (id INTEGER PRIMARY KEY);
+            WITH RECURSIVE sequence(id) AS (
+                SELECT 1
+                UNION ALL
+                SELECT id + 1 FROM sequence WHERE id < 100001
+            )
+            INSERT INTO many_rows SELECT id FROM sequence;
+        `);
+        await service.openDatabase(databasePath);
+
+        const capped = await service.getTableData('many_rows', 100001);
+        const unsafe = await service.getTableData('many_rows', Number.MAX_SAFE_INTEGER + 1);
+
+        assert.strictEqual(capped.values.length, 100000);
+        assert.strictEqual(unsafe.values.length, 1000);
     });
 
     test('supports text and composite primary keys, WITHOUT ROWID, and primary-key edits', async () => {
@@ -383,6 +403,16 @@ suite('Stable cell editing', () => {
         assert.strictEqual(shadowed.editable, false);
         assert.ok(shadowed.rowIdentities.every(identity => identity === null));
         assert.match(shadowed.editError || '', /rowid aliases are shadowed/);
+        const forgedShadowedIdentity: RowIdentity = {
+            kind: 'rowid',
+            parts: [{ column: 'rowid', value: 'r' }]
+        };
+        await assert.rejects(
+            service.updateCellData('shadowed', forgedShadowedIdentity, 'value', 'must-not-write'),
+            /rowid aliases are shadowed/
+        );
+        const shadowedAfterUpdate = await service.getTableData('shadowed');
+        assert.strictEqual(shadowedAfterUpdate.values[0][3], 'unchanged');
 
         const view = await service.getTableData('stable_view');
         assert.strictEqual(view.editable, false);

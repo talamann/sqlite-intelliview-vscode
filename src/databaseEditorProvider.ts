@@ -634,9 +634,16 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
         }
     }
 
-    private async handleTableDataRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, key?: string, page?: number, pageSize?: number, setSync: boolean = true) {
+    private async handleTableDataRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, key?: string, page?: number, pageSize?: number, setSync: boolean = true, syncToken?: TableSyncState) {
+        const syncIsCurrent = () => !syncToken || this.lastSync.get(databasePath) === syncToken;
         try {
+            if (!syncIsCurrent()) {
+                return;
+            }
             const dbService = await this.getOrCreateConnection(databasePath, key);
+            if (!syncIsCurrent()) {
+                return;
+            }
             
             // Use pagination if provided, otherwise use default behavior
             let result;
@@ -657,6 +664,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                     totalRowsKnown = false;
                     // Compute count in background and update UI when ready
                     dbService.getRowCount(tableName).then(count => {
+                        if (!syncIsCurrent()) {
+                            return;
+                        }
                         this.rowCountCache.set(cacheKey, count);
                         this.postWebviewMessage(webviewPanel.webview, {
                             type: 'tableRowCount',
@@ -674,6 +684,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 totalRowCount = result.values.length;
                 totalRowsKnown = true;
             }
+            if (!syncIsCurrent()) {
+                return;
+            }
 
             // Get foreign key information for the table
             const metaKey = `${databasePath}:${tableName}`;
@@ -681,6 +694,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
             if (foreignKeys.length === 0) {
                 try {
                     foreignKeys = await dbService.getForeignKeys(tableName);
+                    if (!syncIsCurrent()) {
+                        return;
+                    }
                     this.foreignKeysCache.set(metaKey, foreignKeys);
                 } catch (err) {
                     this.debugWarn('getForeignKeys', `Failed to fetch foreign keys for ${tableName}:`, err);
@@ -694,6 +710,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
             if (!columnInfo) {
                 // Fill in background; UI doesn't need this to render the page.
                 dbService.getTableInfo(tableName).then(info => {
+                    if (!syncIsCurrent()) {
+                        return;
+                    }
                     this.tableInfoCache.set(metaKey, info as any[]);
                     this.postWebviewMessage(webviewPanel.webview, {
                         type: 'tableColumnInfo',
@@ -705,6 +724,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 });
             }
 
+            if (!syncIsCurrent()) {
+                return;
+            }
             this.postWebviewMessage(webviewPanel.webview, {
                 type: 'tableData',
                 success: true,
@@ -723,14 +745,15 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
             });
             // cache this page for future diffs ONLY if this is a user-initiated load
             if (setSync) {
-                this.lastSync.set(databasePath, {
+                const nextSync = syncToken || {
                     table: tableName!,
                     since: '',
                     page: page!,
                     pageSize: pageSize!,
-                    key,
-                    lastPageData: result.values // <--- store the actual rows
-                });
+                    key
+                };
+                nextSync.lastPageData = result.values;
+                this.lastSync.set(databasePath, nextSync);
                 this.debugLog('getTableDataPaginated', 'lastSync set for', databasePath, {
                     table: tableName,
                     page,
@@ -739,6 +762,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 });
             }
         } catch (error) {
+            if (!syncIsCurrent()) {
+                return;
+            }
             this.postWebviewMessage(webviewPanel.webview, {
                 type: 'error',
                 message: `Failed to load table data: ${error}`
@@ -775,7 +801,8 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                     key,
                     sync.page,
                     sync.pageSize,
-                    true
+                    true,
+                    sync
                 );
             }
         } catch (error) {

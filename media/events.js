@@ -57,19 +57,6 @@ function isExtensionToWebviewMessage(value) {
 }
 
 /**
- * Best-effort stringify for debug logging; never throw on circular values.
- * @param {unknown} value
- * @returns {string}
- */
-function safeDebugStringify(value) {
-  try {
-    return JSON.stringify(value);
-  } catch (_) {
-    return "[unserializable message]";
-  }
-}
-
-/**
  * Initialize all event listeners
  */
 /**
@@ -705,21 +692,13 @@ function handleExtensionMessage(event) {
   const rawMessage = event.data;
   if (!isExtensionToWebviewMessage(rawMessage)) {
     if (window.debug) {
-      window.debug.debug(
-        `[Events] Ignoring invalid extension message: ${safeDebugStringify(
-          rawMessage,
-        )}`,
-      );
+      window.debug.debug("[Events] Ignoring invalid extension message");
     }
     return;
   }
   const message = rawMessage;
   if (window.debug) {
-    window.debug.debug(
-      `[Events] Received message: ${message.type}, ${safeDebugStringify(
-        message,
-      )}`,
-    );
+    window.debug.debug(`[Events] Received message: ${message.type}`);
   }
 
   // Some errors should force the sidebar open so the user can enter a key, etc.
@@ -3086,7 +3065,7 @@ function handleCellUpdateSuccess(message) {
         newValue === null || newValue === undefined ? "" : String(newValue),
       );
 
-      if (newValue === null || newValue === "") {
+      if (newValue === null || newValue === undefined) {
         cellContent.innerHTML = "<em>NULL</em>";
       } else {
         cellContent.textContent = newValue;

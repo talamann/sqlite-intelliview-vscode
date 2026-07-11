@@ -631,7 +631,7 @@ export class DatabaseService {
             throw new Error('Database not opened');
         }
 
-        const safeLimit = Number.isInteger(limit) && limit > 0 ? limit : 1000;
+        const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 100000) : 1000;
         const safeOffset = Number.isInteger(offset) && offset >= 0 ? offset : 0;
         const editability = await this.getTableEditability(tableName);
         const definition = editability.definition;
