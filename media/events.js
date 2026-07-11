@@ -49,9 +49,9 @@ function isExtensionToWebviewMessage(value) {
     !!value &&
     typeof value === "object" &&
     "type" in value &&
-    typeof /** @type {{type?: unknown}} */ (value).type === "string" &&
+    typeof (/** @type {{type?: unknown}} */ (value).type) === "string" &&
     EXTENSION_TO_WEBVIEW_MESSAGE_TYPES.has(
-      /** @type {{type: string}} */ (value).type
+      /** @type {{type: string}} */ (value).type,
     )
   );
 }
@@ -105,7 +105,7 @@ function initializeEventListeners() {
     window.debug.debug(
       `[events.js] initializeEventListeners called. Guard: ${
         window["_eventListenersInitialized"]
-      }, Stack: ${new Error().stack}`
+      }, Stack: ${new Error().stack}`,
     );
   }
   /** @type {any} */
@@ -203,7 +203,7 @@ function initializeEventListeners() {
   window["_eventListenersInitialized"] = true;
   if (window.debug) {
     window.debug.debug(
-      "[events.js] Event listeners registered. Guard set to true."
+      "[events.js] Event listeners registered. Guard set to true.",
     );
   }
 }
@@ -573,7 +573,7 @@ function persistFallbackReloadSnapshot() {
     const snapshot = buildFallbackReloadSnapshot();
     sessionStorage.setItem(
       FALLBACK_RELOAD_SNAPSHOT_KEY,
-      JSON.stringify(snapshot)
+      JSON.stringify(snapshot),
     );
     return true;
   } catch (_) {
@@ -707,8 +707,8 @@ function handleExtensionMessage(event) {
     if (window.debug) {
       window.debug.debug(
         `[Events] Ignoring invalid extension message: ${safeDebugStringify(
-          rawMessage
-        )}`
+          rawMessage,
+        )}`,
       );
     }
     return;
@@ -717,8 +717,8 @@ function handleExtensionMessage(event) {
   if (window.debug) {
     window.debug.debug(
       `[Events] Received message: ${message.type}, ${safeDebugStringify(
-        message
-      )}`
+        message,
+      )}`,
     );
   }
 
@@ -809,7 +809,7 @@ function handleExtensionMessage(event) {
           showSuccess(
             bytes
               ? `Blob saved (${bytes.toLocaleString()} bytes)`
-              : "Blob saved"
+              : "Blob saved",
           );
         }
       } else {
@@ -907,8 +907,7 @@ function handleUpdate(message) {
   const currentState =
     typeof getCurrentState === "function" ? getCurrentState() : {};
   const isInitialDatabaseBind =
-    !!message.databasePath &&
-    (!currentState || !currentState.databasePath);
+    !!message.databasePath && (!currentState || !currentState.databasePath);
 
   if (
     settings &&
@@ -963,7 +962,7 @@ function handleUpdate(message) {
     if (typeof window.updateState === "function") {
       window.updateState(
         { allTables: message.tables },
-        { renderTabs: false, renderSidebar: false }
+        { renderTabs: false, renderSidebar: false },
       );
     }
     displayTablesList(message.tables);
@@ -988,8 +987,8 @@ function handleDatabaseInfo(message) {
   if (window.debug) {
     window.debug.debug(
       `[Events] handleDatabaseInfo called with message: ${JSON.stringify(
-        message
-      )}`
+        message,
+      )}`,
     );
   }
 
@@ -1027,7 +1026,7 @@ function handleDatabaseInfo(message) {
     if (typeof window.updateState === "function") {
       window.updateState(
         { allTables: message.tables || [] },
-        { renderTabs: false, renderSidebar: false }
+        { renderTabs: false, renderSidebar: false },
       );
     }
     if (typeof displayTablesList !== "undefined") {
@@ -1063,7 +1062,11 @@ function handleDatabaseInfo(message) {
       if (s && s.activeTab !== activeMainTab) {
         window.updateState(
           { activeTab: activeMainTab },
-          { renderTabs: false, renderSidebar: false, persistState: "debounced" }
+          {
+            renderTabs: false,
+            renderSidebar: false,
+            persistState: "debounced",
+          },
         );
       }
     }
@@ -1110,7 +1113,7 @@ function handleDatabaseInfo(message) {
         if (!state.selectedTable || !state.activeTable) {
           window.updateState(
             { selectedTable: selected, activeTable: selected },
-            { renderTabs: false, renderSidebar: false }
+            { renderTabs: false, renderSidebar: false },
           );
         }
       }
@@ -1140,8 +1143,8 @@ function handleDatabaseInfo(message) {
             vs && typeof vs.pageSize === "number"
               ? vs.pageSize
               : typeof state.pageSize === "number"
-              ? state.pageSize
-              : 100;
+                ? state.pageSize
+                : 100;
           window.vscode.postMessage({
             type: "getTableData",
             tableName: selected,
@@ -1159,7 +1162,7 @@ function handleDatabaseInfo(message) {
   } else {
     if (window.debug) {
       window.debug.debug(
-        `[Events] Database connection failed: ${message.error}`
+        `[Events] Database connection failed: ${message.error}`,
       );
     }
 
@@ -1182,7 +1185,7 @@ function handleDatabaseInfo(message) {
     // Show connection section for retry when database is disconnected
     if (window.debug) {
       window.debug.debug(
-        "Database connection failed, showing connection section"
+        "Database connection failed, showing connection section",
       );
     }
     showConnectionSection();
@@ -1206,7 +1209,7 @@ function handleQueryResult(message) {
     const rowText = rowCount === 1 ? "row" : "rows";
     if (typeof showSuccess !== "undefined") {
       showSuccess(
-        `Query executed successfully. ${rowCount} ${rowText} returned. Results are available in the Data tab.`
+        `Query executed successfully. ${rowCount} ${rowText} returned. Results are available in the Data tab.`,
       );
     }
   } else {
@@ -1233,7 +1236,7 @@ function handleQueryResult(message) {
       try {
         if (window.debug) {
           window.debug.debug(
-            "handleQueryResult: Ensuring Monaco editor responsiveness"
+            "handleQueryResult: Ensuring Monaco editor responsiveness",
           );
         }
 
@@ -1263,7 +1266,7 @@ function handleQueryResult(message) {
         if (window.debug) {
           window.debug.error(
             "handleQueryResult: Error ensuring editor responsiveness:",
-            error
+            error,
           );
         }
         // If there's an issue, try refreshing the editor
@@ -1369,7 +1372,7 @@ function handleTableRowCount(message) {
   }
 
   const wrapper = document.querySelector(
-    `.enhanced-table-wrapper[data-table="${tableName}"]`
+    `.enhanced-table-wrapper[data-table="${tableName}"]`,
   );
   if (!wrapper) {
     return;
@@ -1380,11 +1383,11 @@ function handleTableRowCount(message) {
 
   const pageSize = parseInt(
     wrapper.getAttribute("data-page-size") || "100",
-    10
+    10,
   );
   const currentPage = parseInt(
     wrapper.getAttribute("data-current-page") || "1",
-    10
+    10,
   );
   const totalPages = Math.ceil(totalRows / pageSize);
 
@@ -1396,7 +1399,7 @@ function handleTableRowCount(message) {
   const startIndex = (currentPage - 1) * pageSize;
   const pageRows = parseInt(wrapper.getAttribute("data-page-rows") || "0", 10);
   const renderedRows = wrapper.querySelectorAll(
-    "tbody tr.resizable-row"
+    "tbody tr.resizable-row",
   ).length;
   const endIndex = startIndex + (pageRows || renderedRows);
   const visibleRows = wrapper.querySelector(".visible-rows");
@@ -1416,7 +1419,7 @@ function handleTableRowCount(message) {
       paginationContainer.innerHTML = window.createPaginationControls(
         currentPage,
         totalPages,
-        tableId
+        tableId,
       );
     } else {
       paginationContainer.innerHTML = "";
@@ -1454,12 +1457,12 @@ function handleERDiagram(message) {
     if (typeof addDebugMessage !== "undefined") {
       addDebugMessage("Received ER diagram data from extension");
       addDebugMessage(
-        `Found ${message.tables ? message.tables.length : 0} tables`
+        `Found ${message.tables ? message.tables.length : 0} tables`,
       );
       addDebugMessage(
         `Found ${
           message.relationships ? message.relationships.length : 0
-        } relationships`
+        } relationships`,
       );
     }
 
@@ -1501,7 +1504,7 @@ function handleERDiagram(message) {
       showDiagramError(message.error || "Unknown error");
     } else if (typeof showError !== "undefined") {
       showError(
-        "Failed to generate ER diagram: " + (message.error || "Unknown error")
+        "Failed to generate ER diagram: " + (message.error || "Unknown error"),
       );
     }
   }
@@ -1564,7 +1567,7 @@ function captureCurrentDataViewState() {
     tableKey,
     { page: currentPage, pageSize, searchTerm, scrollTop, scrollLeft },
     // Tab switches also update `activeTable/selectedTable`, so avoid extra persistence work here.
-    { renderTabs: false, renderSidebar: false, persistState: "none" }
+    { renderTabs: false, renderSidebar: false, persistState: "none" },
   );
 }
 
@@ -1627,7 +1630,7 @@ function applyTabViewStateToWrapper(tableWrapper, tabKey) {
         }
       } else {
         const header = table.querySelector(
-          `th[data-column-name="${columnName}"]`
+          `th[data-column-name="${columnName}"]`,
         );
         const colIndex = header
           ? parseInt(header.getAttribute("data-column") || "-1", 10)
@@ -1662,14 +1665,14 @@ function applyTabViewStateToWrapper(tableWrapper, tabKey) {
                 typeof window.getCellValue === "function"
                   ? window.getCellValue(aCell)
                   : aCell && aCell.textContent
-                  ? aCell.textContent.trim()
-                  : "";
+                    ? aCell.textContent.trim()
+                    : "";
               const bValue =
                 typeof window.getCellValue === "function"
                   ? window.getCellValue(bCell)
                   : bCell && bCell.textContent
-                  ? bCell.textContent.trim()
-                  : "";
+                    ? bCell.textContent.trim()
+                    : "";
               return cmp(aValue ?? "", bValue ?? "", dir);
             });
             rows.forEach((row) => tbody.appendChild(row));
@@ -1754,7 +1757,7 @@ function applyTabViewStateToWrapper(tableWrapper, tabKey) {
         const colIndex = th.getAttribute("data-column");
         if (colIndex) {
           const col = table.querySelector(
-            `colgroup col[data-column="${colIndex}"]`
+            `colgroup col[data-column="${colIndex}"]`,
           );
           if (col && col instanceof HTMLElement) {
             col.style.width = `${w}px`;
@@ -1842,11 +1845,11 @@ function applyTabViewStateToWrapper(tableWrapper, tabKey) {
   const applyScroll = (attempt = 0) => {
     const maxTop = Math.max(
       0,
-      scrollContainer.scrollHeight - scrollContainer.clientHeight
+      scrollContainer.scrollHeight - scrollContainer.clientHeight,
     );
     const maxLeft = Math.max(
       0,
-      scrollContainer.scrollWidth - scrollContainer.clientWidth
+      scrollContainer.scrollWidth - scrollContainer.clientWidth,
     );
     const desiredTop = Math.max(0, Math.min(maxTop, targetTop));
     const desiredLeft = Math.max(0, Math.min(maxLeft, targetLeft));
@@ -1859,7 +1862,7 @@ function applyTabViewStateToWrapper(tableWrapper, tabKey) {
     } else {
       scrollContainer.removeAttribute("data-viewstate-restoring-scroll");
       const prev = scrollContainer.getAttribute(
-        "data-viewstate-prev-scroll-behavior"
+        "data-viewstate-prev-scroll-behavior",
       );
       if (prev !== null) {
         if (prev) {
@@ -1923,10 +1926,10 @@ function displayTablesList(tables) {
   const elements = getAllDOMElements ? getAllDOMElements() : {};
   if (window.debug) {
     window.debug.debug(
-      `[Events] displayTablesList called with: ${JSON.stringify(tables)}`
+      `[Events] displayTablesList called with: ${JSON.stringify(tables)}`,
     );
     window.debug.debug(
-      `[Events] tablesListElement: ${elements.tablesListElement}`
+      `[Events] tablesListElement: ${elements.tablesListElement}`,
     );
   }
 
@@ -1946,7 +1949,7 @@ function displayTablesList(tables) {
   if (typeof window.updateState === "function") {
     window.updateState(
       { allTables: tables },
-      { renderTabs: false, renderSidebar: false }
+      { renderTabs: false, renderSidebar: false },
     );
   }
 
@@ -1960,8 +1963,8 @@ function displayTablesList(tables) {
       const isSelected = state.selectedTable === table.name;
       return `
         <div class="table-item${isSelected ? " selected" : ""}" data-table="${
-        table.name
-      }">
+          table.name
+        }">
           <span class="table-name">${table.name}</span>
         </div>
       `;
@@ -1996,7 +1999,7 @@ function displayTablesList(tables) {
 
   if (window.debug) {
     window.debug.debug(
-      "[Events] Tables HTML generated, adding event listeners..."
+      "[Events] Tables HTML generated, adding event listeners...",
     );
   }
 
@@ -2030,7 +2033,7 @@ function displayTablesList(tables) {
     if (openTables.length === 0) {
       // Map to string names if needed
       const tableNames = tables.map((t) =>
-        typeof t === "string" ? t : t.name
+        typeof t === "string" ? t : t.name,
       );
       if (typeof window.openTableTab === "function" && tableNames[0]) {
         window.openTableTab(tableNames[0]);
@@ -2046,7 +2049,7 @@ function displayTablesList(tables) {
 
   if (window.debug) {
     window.debug.debug(
-      `[Events] Event listeners added to ${tables.length} tables`
+      `[Events] Event listeners added to ${tables.length} tables`,
     );
   }
 }
@@ -2148,7 +2151,7 @@ function displayQueryResults(data, columns, query = null) {
   const now = new Date();
   const pad = (n) => n.toString().padStart(2, "0");
   const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(
-    now.getDate()
+    now.getDate(),
   )} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
   let tabKey = `Results (${dateStr})`;
   let tabLabel = tabKey;
@@ -2262,7 +2265,7 @@ function restoreEditorState(editorState) {
     if (window.debug) {
       window.debug.debug(
         "restoreEditorState: Restoring editor state",
-        editorState
+        editorState,
       );
     }
 
@@ -2303,14 +2306,14 @@ function restoreEditorState(editorState) {
 
     if (window.debug) {
       window.debug.debug(
-        "restoreEditorState: Editor state restored successfully"
+        "restoreEditorState: Editor state restored successfully",
       );
     }
   } catch (error) {
     if (window.debug) {
       window.debug.debug(
         "restoreEditorState: Error restoring editor state:",
-        error
+        error,
       );
     }
   }
@@ -2343,7 +2346,7 @@ function displayTableSchema(data, columns, foreignKeys = []) {
 
   // Initialize table features for the new table
   const tableWrapper = elements.schemaContent.querySelector(
-    ".enhanced-table-wrapper"
+    ".enhanced-table-wrapper",
   );
   if (tableWrapper && typeof initializeTableEvents !== "undefined") {
     initializeTableEvents(tableWrapper);
@@ -2378,7 +2381,7 @@ function displayTableData(data, columns, tableName, options = {}) {
 
   // Initialize table features for the new table
   const tableWrapper = elements.dataContent.querySelector(
-    ".enhanced-table-wrapper"
+    ".enhanced-table-wrapper",
   );
   if (tableWrapper && typeof initializeTableEvents !== "undefined") {
     initializeTableEvents(tableWrapper);
@@ -2481,7 +2484,7 @@ function initializeTableEvents(tableWrapper) {
           window.setTabViewState(
             tableKey,
             { searchTerm },
-            { renderTabs: false, renderSidebar: false }
+            { renderTabs: false, renderSidebar: false },
           );
         }
       });
@@ -2503,7 +2506,7 @@ function initializeTableEvents(tableWrapper) {
           window.setTabViewState(
             tableKey,
             { searchTerm: "" },
-            { renderTabs: false, renderSidebar: false }
+            { renderTabs: false, renderSidebar: false },
           );
         }
       });
@@ -2511,7 +2514,7 @@ function initializeTableEvents(tableWrapper) {
 
     // Scroll position persistence (throttled)
     const scrollContainer = tableWrapper.querySelector(
-      ".table-scroll-container"
+      ".table-scroll-container",
     );
     if (
       scrollContainer &&
@@ -2544,7 +2547,7 @@ function initializeTableEvents(tableWrapper) {
               renderTabs: false,
               renderSidebar: false,
               persistState: "debounced",
-            }
+            },
           );
         }, 400);
       });
@@ -2569,7 +2572,7 @@ function initializeTableEvents(tableWrapper) {
     });
     // Column action buttons (including pin buttons)
     const actionBtns = tableWrapper.querySelectorAll(
-      ".column-action-btn, .pin-btn"
+      ".column-action-btn, .pin-btn",
     );
     actionBtns.forEach((btn) => {
       btn.addEventListener("click", (e) => {
@@ -2647,9 +2650,9 @@ function initializeTableEvents(tableWrapper) {
           target.closest(".enhanced-table-wrapper") || tableWrapper;
         const val = parseInt(
           String(
-            target instanceof HTMLInputElement ? target.value : target.value
+            target instanceof HTMLInputElement ? target.value : target.value,
           ),
-          10
+          10,
         );
         if (!isNaN(val) && typeof window.updateTablePage === "function") {
           ke.preventDefault();
@@ -2667,9 +2670,9 @@ function initializeTableEvents(tableWrapper) {
           target.closest(".enhanced-table-wrapper") || tableWrapper;
         const val = parseInt(
           String(
-            target instanceof HTMLInputElement ? target.value : target.value
+            target instanceof HTMLInputElement ? target.value : target.value,
           ),
-          10
+          10,
         );
         if (!isNaN(val) && typeof window.updateTablePage === "function") {
           window.updateTablePage(wrapper, val);
@@ -2880,6 +2883,17 @@ function saveCellEdit(cell) {
     return;
   }
 
+  const win = /** @type {any} */ (window);
+  const activeRequestId = cell.getAttribute("data-edit-request-id");
+  if (
+    cell.classList.contains("saving") ||
+    (activeRequestId &&
+      win.__pendingCellEdits instanceof Map &&
+      win.__pendingCellEdits.has(activeRequestId))
+  ) {
+    return;
+  }
+
   const input = cell.querySelector(".cell-input");
   if (!input) {
     return;
@@ -2904,7 +2918,8 @@ function saveCellEdit(cell) {
   const tableId = wrapper?.getAttribute("data-table-id") || "";
   const localIndex = parseInt(row?.getAttribute("data-local-index") || "", 10);
   const tableStash = /** @type {any} */ (window).__tableDataStash;
-  const stashedTable = tableId && tableStash instanceof Map ? tableStash.get(tableId) : null;
+  const stashedTable =
+    tableId && tableStash instanceof Map ? tableStash.get(tableId) : null;
   const rowIdentity =
     stashedTable &&
     Array.isArray(stashedTable.rowIdentities) &&
@@ -2918,7 +2933,7 @@ function saveCellEdit(cell) {
     }
     if (typeof showError !== "undefined") {
       showError(
-        "This row cannot be identified safely. Refresh the table before editing."
+        "This row cannot be identified safely. Refresh the table before editing.",
       );
     }
     cancelCellEdit(cell);
@@ -2928,7 +2943,6 @@ function saveCellEdit(cell) {
   // Show saving state
   cell.classList.add("saving");
   cell.classList.remove("error");
-  const win = /** @type {any} */ (window);
   win.__cellEditSequence = Number(win.__cellEditSequence || 0) + 1;
   const requestId = `cell-edit-${Date.now()}-${win.__cellEditSequence}`;
   cell.setAttribute("data-edit-request-id", requestId);
@@ -2967,10 +2981,9 @@ function findPendingEditCell(requestId) {
     return null;
   }
   return Array.from(
-    document.querySelectorAll(".data-cell[data-edit-request-id]")
+    document.querySelectorAll(".data-cell[data-edit-request-id]"),
   ).find(
-    (candidate) =>
-      candidate.getAttribute("data-edit-request-id") === requestId
+    (candidate) => candidate.getAttribute("data-edit-request-id") === requestId,
   );
 }
 
@@ -3017,19 +3030,24 @@ function handleCellUpdateSuccess(message) {
 
   const pending = takePendingCellEdit(requestId);
   const cell = pending?.cell || findPendingEditCell(requestId);
-  const tableId = pending?.tableId || cell?.closest(".enhanced-table-wrapper")?.getAttribute("data-table-id") || "";
+  const tableId =
+    pending?.tableId ||
+    cell?.closest(".enhanced-table-wrapper")?.getAttribute("data-table-id") ||
+    "";
   const localIndex = Number.isInteger(pending?.localIndex)
     ? pending.localIndex
     : parseInt(
-        cell?.closest("tr[data-local-index]")?.getAttribute("data-local-index") || "",
-        10
+        cell
+          ?.closest("tr[data-local-index]")
+          ?.getAttribute("data-local-index") || "",
+        10,
       );
   const columnIndex = Number.isInteger(pending?.columnIndex)
     ? pending.columnIndex
     : parseInt(cell?.getAttribute("data-column") || "", 10);
   const wrapper = Array.from(
-    document.querySelectorAll(".enhanced-table-wrapper[data-table-id]")
-  ).find(candidate => candidate.getAttribute("data-table-id") === tableId);
+    document.querySelectorAll(".enhanced-table-wrapper[data-table-id]"),
+  ).find((candidate) => candidate.getAttribute("data-table-id") === tableId);
   const tableStash = /** @type {any} */ (window).__tableDataStash;
   const stashedTable =
     tableId && tableStash instanceof Map ? tableStash.get(tableId) : null;
@@ -3065,7 +3083,7 @@ function handleCellUpdateSuccess(message) {
     if (cellContent) {
       cellContent.setAttribute(
         "data-original-value",
-        newValue === null || newValue === undefined ? "" : String(newValue)
+        newValue === null || newValue === undefined ? "" : String(newValue),
       );
 
       if (newValue === null || newValue === "") {
@@ -3143,8 +3161,8 @@ function handleDeleteRowSuccess(message) {
   if (window.debug) {
     window.debug.debug(
       `[Events] Row deleted successfully from ${tableName}: ${JSON.stringify(
-        rowId
-      )}`
+        rowId,
+      )}`,
     );
   }
 }
@@ -3165,7 +3183,7 @@ function handleDeleteRowError(message) {
 
   if (window.debug) {
     window.debug.debug(
-      `[Events] Failed to delete row from ${tableName}: ${message.message}`
+      `[Events] Failed to delete row from ${tableName}: ${message.message}`,
     );
   }
 }
@@ -3299,19 +3317,19 @@ function handleTableDataDelta({
   // Capture old total count BEFORE updating anything (for notification)
   let oldTotalCountForNotification = 0;
   const wrapperForOldCount = document.querySelector(
-    `.enhanced-table-wrapper[data-table="${tableName}"]`
+    `.enhanced-table-wrapper[data-table="${tableName}"]`,
   );
   if (wrapperForOldCount) {
     oldTotalCountForNotification = parseInt(
       wrapperForOldCount.getAttribute("data-total-rows") || "0",
-      10
+      10,
     );
   }
 
   // Update the total count display if provided
   if (totalCount !== null) {
     const wrapper = document.querySelector(
-      `.enhanced-table-wrapper[data-table="${tableName}"]`
+      `.enhanced-table-wrapper[data-table="${tableName}"]`,
     );
     if (wrapper) {
       // Update the header "125 RECORDS" count
@@ -3344,11 +3362,11 @@ function handleTableDataDelta({
       // Update pagination controls to reflect new total count
       const currentPage = parseInt(
         wrapper.getAttribute("data-current-page") || "1",
-        10
+        10,
       );
       const pageSize = parseInt(
         wrapper.getAttribute("data-page-size") || "100",
-        10
+        10,
       );
       const totalPages = Math.ceil(totalCount / pageSize);
 
@@ -3365,7 +3383,7 @@ function handleTableDataDelta({
           paginationContainer.innerHTML = window.createPaginationControls(
             currentPage,
             totalPages,
-            tableId
+            tableId,
           );
 
           if (window.debug) {
@@ -3432,7 +3450,7 @@ function handleTableDataDelta({
       const now = Date.now();
       const store =
         /** @type {any} */ (window).__externalDeltaNotificationTimes ||
-        ((/** @type {any} */ (window).__externalDeltaNotificationTimes = {}));
+        /** @type {any} */ (window.__externalDeltaNotificationTimes = {});
       const lastAt =
         typeof store[dedupeKey] === "number" ? store[dedupeKey] : 0;
 
@@ -3441,7 +3459,7 @@ function handleTableDataDelta({
         window.showNotification(
           `Database files changed (likely WAL checkpoint/refresh), but no visible changes were detected in ${tableName} table.`,
           "info",
-          5000
+          5000,
         );
       }
     } else {
@@ -3450,7 +3468,7 @@ function handleTableDataDelta({
   }
 
   const wrapper = document.querySelector(
-    `.enhanced-table-wrapper[data-table="${tableName}"]`
+    `.enhanced-table-wrapper[data-table="${tableName}"]`,
   );
   if (!wrapper) {
     if (window.debug) {
@@ -3477,7 +3495,7 @@ function handleTableDataDelta({
       .map((rowIndex) => toLocal(rowIndex))
       .filter(
         (local) =>
-          Number.isFinite(local) && local >= 0 && local < vs.pageData.length
+          Number.isFinite(local) && local >= 0 && local < vs.pageData.length,
       )
       .sort((a, b) => b - a);
     deleteLocals.forEach((local) => {
@@ -3495,7 +3513,7 @@ function handleTableDataDelta({
           Number.isFinite(x.local) &&
           x.local >= 0 &&
           x.local <= pageSize &&
-          Array.isArray(x.rowData)
+          Array.isArray(x.rowData),
       )
       .sort((a, b) => a.local - b.local);
     insertLocals.forEach(({ local, rowData }) => {
@@ -3590,7 +3608,7 @@ function handleTableDataDelta({
       });
       // Use renderTableRows to generate the new row HTML, but robustly patch FK cells after creation
       let columns = Array.from(wrapper.querySelectorAll("thead th")).map((th) =>
-        th.getAttribute("data-column-name")
+        th.getAttribute("data-column-name"),
       );
       // Fallback: if any column name is missing, try to get from global schema (handle window typing)
       /** @type {any} */ const win =
@@ -3606,7 +3624,7 @@ function handleTableDataDelta({
             if (window.debug) {
               window.debug.debug(
                 "[events.js] No columns found in global schema for table",
-                tableName
+                tableName,
               );
             }
           }
@@ -3615,7 +3633,7 @@ function handleTableDataDelta({
             window.debug.debug(
               "[events.js] Some column names missing in <th> for table",
               tableName,
-              columns
+              columns,
             );
           }
         }
@@ -3716,7 +3734,7 @@ function handleTableDataDelta({
           window.debug.debug(
             "[events.js] Failed to create new row for insert",
             rowIndex,
-            rowData
+            rowData,
           );
         }
       }
@@ -3754,7 +3772,7 @@ function handleTableDataDelta({
   // After all new rows are inserted via delta, re-initialize table events for the wrapper
   // Diagnostic: log new rows and wrapper state before and after initialization
   const newRows = wrapper.querySelectorAll(
-    "tr[data-rowid]:not([data-initialized])"
+    "tr[data-rowid]:not([data-initialized])",
   );
   if (window.debug) {
     window.debug.debug("[Delta Debug] New rows before init:", newRows);
@@ -3763,7 +3781,7 @@ function handleTableDataDelta({
       "[Delta Debug] Guard before table event init:",
       window["_eventListenersInitialized"],
       "Stack:",
-      new Error().stack
+      new Error().stack,
     );
   }
   // Only initialize table events, never global events here
@@ -3777,7 +3795,7 @@ function handleTableDataDelta({
       "[Delta Debug] Guard after table event init:",
       window["_eventListenersInitialized"],
       "Stack:",
-      new Error().stack
+      new Error().stack,
     );
   }
 }

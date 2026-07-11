@@ -1123,12 +1123,16 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
             const db = await this.getOrCreateConnection(databasePath, key);
             const newResult = await db.getTableDataPaginated(table, page, pageSize);
             const newTotalCount = await db.getRowCount(table);
-            this.rowCountCache.set(this.getTableCacheKey(databasePath, table), newTotalCount);
-            this.debugLog('DatabaseChange', 'New page data fetched', { rowCount: newResult.values.length, newTotalCount });
             const [foreignKeys, columnInfo] = await Promise.all([
                 db.getForeignKeys(table),
                 db.getTableInfo(table)
             ]);
+            if (this.lastSync.get(databasePath) !== sync) {
+                this.debugLog('DatabaseChange', `Discarding stale refresh result for ${databasePath}`);
+                return;
+            }
+            this.rowCountCache.set(this.getTableCacheKey(databasePath, table), newTotalCount);
+            this.debugLog('DatabaseChange', 'New page data fetched', { rowCount: newResult.values.length, newTotalCount });
             await this.postWebviewMessage(panel.webview, {
                 type: 'tableData',
                 success: true,
@@ -1145,6 +1149,10 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 totalRows: newTotalCount,
                 totalRowsKnown: true
             });
+            if (this.lastSync.get(databasePath) !== sync) {
+                this.debugLog('DatabaseChange', `Discarding stale refresh state for ${databasePath}`);
+                return;
+            }
             sync.lastPageData = newResult.values;
             this.lastSync.set(databasePath, sync);
             this.debugLog('DatabaseChange', 'lastPageData updated in lastSync', {
@@ -1152,12 +1160,13 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 rowCount: sync.lastPageData.length
             });
         } catch (error) {
-            if (sync) {
+            const syncIsCurrent = sync && this.lastSync.get(databasePath) === sync;
+            if (sync && syncIsCurrent) {
                 sync.lastPageData = undefined;
                 this.lastSync.set(databasePath, sync);
             }
             this.debugError('DatabaseChange', `Failed to refresh ${databasePath}:`, error);
-            if (panel) {
+            if (panel && syncIsCurrent) {
                 try {
                     await this.postWebviewMessage(panel.webview, {
                         type: 'error',

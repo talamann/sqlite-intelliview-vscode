@@ -172,7 +172,7 @@ suite('Stable cell editing', () => {
 
     test('paginates deterministically by the stable row identity', async () => {
         createDatabase(`
-            CREATE TABLE ordered_records (code TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE ordered_records (code TEXT PRIMARY KEY NOT NULL, value TEXT);
             INSERT INTO ordered_records VALUES ('charlie', 'C'), ('alpha', 'A'), ('bravo', 'B');
         `);
         await service.openDatabase(databasePath);
@@ -190,7 +190,7 @@ suite('Stable cell editing', () => {
 
     test('supports text and composite primary keys, WITHOUT ROWID, and primary-key edits', async () => {
         createDatabase(`
-            CREATE TABLE text_keys (code TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE text_keys (code TEXT PRIMARY KEY NOT NULL, value TEXT);
             INSERT INTO text_keys VALUES ('alpha', 'A'), ('beta', 'B');
             CREATE TABLE memberships (
                 account TEXT,
@@ -223,10 +223,28 @@ suite('Stable cell editing', () => {
         ]);
     });
 
+    test('uses rowid when a declared primary key permits null values', async () => {
+        createDatabase(`
+            CREATE TABLE nullable_keys (code TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO nullable_keys VALUES (NULL, 'first'), (NULL, 'second');
+        `);
+        await service.openDatabase(databasePath);
+
+        const data = await service.getTableData('nullable_keys');
+        assert.deepStrictEqual(data.rowIdentities.map(identity => identity?.kind), ['rowid', 'rowid']);
+        await service.updateCellData('nullable_keys', data.rowIdentities[1]!, 'value', 'updated-second');
+
+        service.closeDatabase();
+        assert.deepStrictEqual(readRows('SELECT rowid, code, value FROM nullable_keys ORDER BY rowid'), [
+            { rowid: 1, code: null, value: 'first' },
+            { rowid: 2, code: null, value: 'updated-second' }
+        ]);
+    });
+
     test('binds quotes, Unicode, and null values without changing the selected identity', async () => {
         createDatabase(`
             CREATE TABLE content (id INTEGER PRIMARY KEY, value TEXT);
-            INSERT INTO content VALUES (1, 'first'), (5, 'second'), (40, 'third');
+            INSERT INTO content VALUES (1, 'first'), (5, 'second'), (6, 'nonempty'), (40, 'third');
             CREATE TABLE "odd""table" ("key""part" TEXT PRIMARY KEY, "value""text" TEXT);
             INSERT INTO "odd""table" VALUES ('quoted-key', 'old');
         `);
@@ -235,6 +253,8 @@ suite('Stable cell editing', () => {
 
         await service.updateCellData('content', identityFor(data, 'id', 1), 'value', "O'Reilly — 雪");
         await service.updateCellData('content', identityFor(data, 'id', 5), 'value', null);
+        const emptyStringEdit = await service.updateCellData('content', identityFor(data, 'id', 6), 'value', '');
+        assert.strictEqual(emptyStringEdit.value, '');
         const quoted = await service.getTableData('odd"table');
         await service.updateCellData(
             'odd"table',
@@ -247,6 +267,7 @@ suite('Stable cell editing', () => {
         assert.deepStrictEqual(readRows('SELECT id, value FROM content ORDER BY id'), [
             { id: 1, value: "O'Reilly — 雪" },
             { id: 5, value: null },
+            { id: 6, value: '' },
             { id: 40, value: 'third' }
         ]);
         assert.deepStrictEqual(readRows('SELECT "value""text" AS value FROM "odd""table"'), [
@@ -264,10 +285,12 @@ suite('Stable cell editing', () => {
         await service.openDatabase(databasePath);
 
         const integerRows = await service.getTableData('integer_keys');
+        assert.strictEqual(integerRows.values[0][0], '9223372036854775806');
         assert.strictEqual(integerRows.rowIdentities[0]?.parts[0].value, '9223372036854775806');
         await service.updateCellData('integer_keys', integerRows.rowIdentities[0]!, 'value', 'updated-integer-key');
 
         const rowidRows = await service.getTableData('rowid_keys');
+        assert.strictEqual(rowidRows.values[0][0], 'rowid-key');
         assert.strictEqual(rowidRows.rowIdentities[0]?.parts[0].value, '9223372036854775805');
         await service.updateCellData('rowid_keys', rowidRows.rowIdentities[0]!, 'value', 'updated-rowid-key');
 
@@ -337,28 +360,22 @@ suite('Stable cell editing', () => {
         ]);
     });
 
-    test('rejects stale, ambiguous, and unavailable row identities without persisting changes', async () => {
+    test('rejects stale and unavailable row identities without persisting changes', async () => {
         createDatabase(`
-            CREATE TABLE ambiguous (a TEXT, b TEXT, value TEXT, PRIMARY KEY (a, b));
-            INSERT INTO ambiguous VALUES (NULL, 'same', 'first'), (NULL, 'same', 'second');
+            CREATE TABLE stable (a TEXT NOT NULL, b TEXT NOT NULL, value TEXT, PRIMARY KEY (a, b));
+            INSERT INTO stable VALUES ('one', 'same', 'first'), ('two', 'same', 'second');
             CREATE TABLE shadowed (rowid TEXT, _rowid_ TEXT, oid TEXT, value TEXT);
             INSERT INTO shadowed VALUES ('r', 'u', 'o', 'unchanged');
-            CREATE VIEW ambiguous_view AS SELECT * FROM ambiguous;
+            CREATE VIEW stable_view AS SELECT * FROM stable;
         `);
         await service.openDatabase(databasePath);
-
-        const ambiguous = await service.getTableData('ambiguous');
-        await assert.rejects(
-            service.updateCellData('ambiguous', ambiguous.rowIdentities[0]!, 'value', 'must-rollback'),
-            /expected one changed row but SQLite reported 2/
-        );
 
         const staleIdentity: RowIdentity = {
             kind: 'primaryKey',
             parts: [{ column: 'a', value: 'missing' }, { column: 'b', value: 'missing' }]
         };
         await assert.rejects(
-            service.updateCellData('ambiguous', staleIdentity, 'value', 'must-not-write'),
+            service.updateCellData('stable', staleIdentity, 'value', 'must-not-write'),
             /No row was updated/
         );
 
@@ -367,12 +384,12 @@ suite('Stable cell editing', () => {
         assert.ok(shadowed.rowIdentities.every(identity => identity === null));
         assert.match(shadowed.editError || '', /rowid aliases are shadowed/);
 
-        const view = await service.getTableData('ambiguous_view');
+        const view = await service.getTableData('stable_view');
         assert.strictEqual(view.editable, false);
         assert.match(view.editError || '', /Views cannot be edited safely/);
 
         service.closeDatabase();
-        assert.deepStrictEqual(readRows('SELECT value FROM ambiguous ORDER BY rowid'), [
+        assert.deepStrictEqual(readRows('SELECT value FROM stable ORDER BY rowid'), [
             { value: 'first' },
             { value: 'second' }
         ]);

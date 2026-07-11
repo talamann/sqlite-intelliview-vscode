@@ -566,31 +566,43 @@ export class DatabaseService {
         }
 
         const infoStmt = this.db.prepare(`PRAGMA table_info(${this.quoteIdentifier(tableName)})`);
-        const columns: Array<{ name: string; pkOrder: number }> = [];
+        const columns: Array<{ name: string; notNull: boolean; pkOrder: number }> = [];
         while (infoStmt.step()) {
             const row = infoStmt.getAsObject();
             columns.push({
                 name: row.name as string,
+                notNull: Boolean(row.notnull),
                 pkOrder: Number(row.pk) || 0
             });
         }
         infoStmt.free();
 
+        const createSql = typeof table.sql === 'string' ? table.sql : '';
+        const withoutRowid = /\bWITHOUT\s+ROWID\b/i.test(createSql);
         const primaryKeyColumns = columns
             .filter(column => column.pkOrder > 0)
-            .sort((a, b) => a.pkOrder - b.pkOrder)
-            .map(column => column.name);
-        if (primaryKeyColumns.length > 0) {
+            .sort((a, b) => a.pkOrder - b.pkOrder);
+        const indexStmt = this.db.prepare(`PRAGMA index_list(${this.quoteIdentifier(tableName)})`);
+        let hasPrimaryKeyIndex = false;
+        while (indexStmt.step()) {
+            if (indexStmt.getAsObject().origin === 'pk') {
+                hasPrimaryKeyIndex = true;
+                break;
+            }
+        }
+        indexStmt.free();
+        const primaryKeyIsRowidAlias = primaryKeyColumns.length === 1 && !hasPrimaryKeyIndex;
+        const primaryKeyIsNonNull = withoutRowid || primaryKeyIsRowidAlias || primaryKeyColumns.every(column => column.notNull);
+        if (primaryKeyColumns.length > 0 && primaryKeyIsNonNull) {
             return {
                 definition: {
                     kind: 'primaryKey',
-                    columns: primaryKeyColumns
+                    columns: primaryKeyColumns.map(column => column.name)
                 }
             };
         }
 
-        const createSql = typeof table.sql === 'string' ? table.sql : '';
-        if (/\bWITHOUT\s+ROWID\b/i.test(createSql)) {
+        if (withoutRowid) {
             return {
                 definition: null,
                 reason: 'This WITHOUT ROWID table has no declared primary key and cannot be edited safely.'
@@ -640,7 +652,13 @@ export class DatabaseService {
         while (stmt.step()) {
             const identityRow = stmt.get(null, { useBigInt: true }) as Array<SQLiteValue | bigint>;
             identityRows.push(identityRow);
-            rawRows.push(identityRow.map(value => typeof value === 'bigint' ? Number(value) : value));
+            rawRows.push(identityRow.map(value => {
+                if (typeof value !== 'bigint') {
+                    return value;
+                }
+                const numericValue = Number(value);
+                return Number.isSafeInteger(numericValue) ? numericValue : value.toString();
+            }));
         }
         stmt.free();
 
@@ -682,7 +700,7 @@ export class DatabaseService {
     }
 
     private processEditedValue(newValue: unknown): SQLiteValue {
-        if (newValue === '' || newValue === null) {
+        if (newValue === null) {
             return null;
         }
         if (typeof newValue === 'string') {
