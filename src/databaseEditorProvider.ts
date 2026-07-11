@@ -11,7 +11,7 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
     private static activeProvider: DatabaseEditorProvider | undefined;
     private activeConnections: Map<string, DatabaseService> = new Map();
     /** Track last sync state per database for delta updates */
-    private lastSync: Map<string, { table: string; since: string; page: number; pageSize: number; lastPageData?: any[][] }> = new Map();
+    private lastSync: Map<string, { table: string; since: string; page: number; pageSize: number; key?: string; lastPageData?: any[][] }> = new Map();
     private databaseWatcher: DatabaseWatcher = new DatabaseWatcher();
     private webviewPanels: Map<string, vscode.WebviewPanel> = new Map();
     /** cache full pages keyed by `${db}:${table}:${page}:${pageSize}` → QueryResult.values */
@@ -719,6 +719,7 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                     since: '',
                     page: page!,
                     pageSize: pageSize!,
+                    key,
                     lastPageData: result.values // <--- store the actual rows
                 });
                 this.debugLog('getTableDataPaginated', 'lastSync set for', databasePath, { table: tableName, page, pageSize, lastPageData: result.values });
@@ -1078,9 +1079,6 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
 
     private debugLogConnections(): void {
         this.debugLog('Connection', `Active connections (${this.activeConnections.size})`);
-        for (const [key] of this.activeConnections) {
-            this.debugLog('Connection', `Connection Key ${key}`);
-        }
     }
 
     // Add a global cleanup method for extension deactivation
@@ -1099,12 +1097,12 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
         const sync = this.lastSync.get(databasePath);
         this.debugLog('DatabaseChange', `[handleExternalDatabaseChange] Triggered for ${databasePath}`, { hasPanel: !!panel, hasSync: !!sync });
         if (!panel || !sync) {
-            this.debugWarn('DatabaseChange', `[handleExternalDatabaseChange] No panel or sync found for ${databasePath}`, { panel, sync });
+            this.debugWarn('DatabaseChange', `[handleExternalDatabaseChange] No panel or sync found for ${databasePath}`, { hasPanel: !!panel, hasSync: !!sync });
             return;
         }
-        const { table, page, pageSize } = sync;
+        const { table, page, pageSize, key } = sync;
         this.debugLog('DatabaseChange', '[handleExternalDatabaseChange] Using sync state', { table, page, pageSize });
-        const db = await this.getOrCreateConnection(databasePath);
+        const db = await this.getOrCreateConnection(databasePath, key);
         const newResult = await db.getTableDataPaginated(table, page, pageSize);
         const newTotalCount = await db.getRowCount(table);
         this.rowCountCache.set(this.getTableCacheKey(databasePath, table), newTotalCount);
