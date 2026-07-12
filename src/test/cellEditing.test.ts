@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import initSqlJs = require('sql.js');
 import { DatabaseService, EditableTableData, RowIdentity } from '../databaseService';
+import { isWebviewToExtensionMessage } from '../webviewMessages';
 
 suite('Stable cell editing', () => {
     let tempDir: string;
@@ -326,6 +327,43 @@ suite('Stable cell editing', () => {
             readRows('SELECT CAST(rowid AS TEXT) AS rowid, value FROM rowid_keys'),
             [{ rowid: '9223372036854775805', value: 'updated-rowid-key' }]
         );
+    });
+
+    test('round-trips BLOB primary-key identities through webview messages', async () => {
+        createDatabase(`
+            CREATE TABLE blob_keys (id BLOB PRIMARY KEY NOT NULL, value TEXT);
+            INSERT INTO blob_keys VALUES (X'0001FF', 'first'), (X'0002FF', 'second');
+        `);
+        await service.openDatabase(databasePath);
+        const data = await service.getTableData('blob_keys');
+        const message = JSON.parse(JSON.stringify({
+            type: 'updateCellData',
+            tableName: 'blob_keys',
+            requestId: 'blob-update',
+            rowIdentity: data.rowIdentities[0],
+            columnName: 'value',
+            newValue: 'updated-first'
+        }));
+
+        assert.deepStrictEqual(message.rowIdentity.parts[0].value, { type: 'blob', base64: 'AAH/' });
+        assert.ok(isWebviewToExtensionMessage(message));
+        assert.strictEqual(message.type, 'updateCellData');
+        await service.updateCellData(message.tableName, message.rowIdentity, message.columnName, message.newValue);
+
+        const invalidMessage = {
+            ...message,
+            rowIdentity: {
+                ...message.rowIdentity,
+                parts: [{ column: 'id', value: { type: 'blob', base64: 'not-base64' } }]
+            }
+        };
+        assert.strictEqual(isWebviewToExtensionMessage(invalidMessage), false);
+
+        service.closeDatabase();
+        assert.deepStrictEqual(readRows('SELECT hex(id) AS id, value FROM blob_keys ORDER BY id'), [
+            { id: '0001FF', value: 'updated-first' },
+            { id: '0002FF', value: 'second' }
+        ]);
     });
 
     test('restores committed in-memory state when persistence fails', async () => {

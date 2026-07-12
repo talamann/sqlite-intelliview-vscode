@@ -45,9 +45,16 @@ export interface QueryResult {
 
 export type SQLiteValue = number | string | Uint8Array | null;
 
+export interface SerializedBlobIdentityValue {
+    type: 'blob';
+    base64: string;
+}
+
+export type RowIdentityValue = SQLiteValue | SerializedBlobIdentityValue;
+
 export interface RowIdentityPart {
     column: string;
-    value: SQLiteValue;
+    value: RowIdentityValue;
 }
 
 export interface RowIdentity {
@@ -119,18 +126,35 @@ export class DatabaseService {
         return `"${identifier.replace(/"/g, '""')}"`;
     }
 
-    private serializeIdentityValue(value: unknown): SQLiteValue {
+    private serializeIdentityValue(value: unknown): RowIdentityValue {
         if (typeof value === 'bigint') {
             const numericValue = Number(value);
             return Number.isSafeInteger(numericValue) ? numericValue : value.toString();
         }
-        if (value === null || typeof value === 'string' || value instanceof Uint8Array) {
+        if (value instanceof Uint8Array) {
+            return { type: 'blob', base64: Buffer.from(value).toString('base64') };
+        }
+        if (value === null || typeof value === 'string') {
             return value;
         }
         if (typeof value === 'number' && Number.isFinite(value)) {
             return value;
         }
         throw new Error('Row identity contains an unsupported SQLite value.');
+    }
+
+    private deserializeIdentityValue(value: RowIdentityValue): SQLiteValue {
+        if (typeof value === 'object' && value !== null && !(value instanceof Uint8Array)) {
+            if (value.type !== 'blob' || typeof value.base64 !== 'string') {
+                throw new Error('Row identity contains an invalid serialized BLOB value.');
+            }
+            const decoded = Buffer.from(value.base64, 'base64');
+            if (decoded.toString('base64') !== value.base64) {
+                throw new Error('Row identity contains an invalid base64 BLOB value.');
+            }
+            return new Uint8Array(decoded);
+        }
+        return value;
     }
 
     private enqueueEdit<T>(operation: () => Promise<T>): Promise<T> {
@@ -759,7 +783,7 @@ export class DatabaseService {
             .map(column => `${this.quoteIdentifier(column)} IS ?`)
             .join(' AND ');
         const updateQuery = `UPDATE ${this.quoteIdentifier(tableName)} SET ${this.quoteIdentifier(columnName)} = ? WHERE ${whereClause}`;
-        const parameters = [processedValue, ...identity.parts.map(part => part.value)];
+        const parameters = [processedValue, ...identity.parts.map(part => this.deserializeIdentityValue(part.value))];
         let stmt: any = null;
         let transactionOpen = false;
         let committed = false;
@@ -793,7 +817,7 @@ export class DatabaseService {
                 kind: identity.kind,
                 parts: identity.parts.map(part => ({
                     column: part.column,
-                    value: part.column === columnName ? processedValue : part.value
+                    value: part.column === columnName ? this.serializeIdentityValue(processedValue) : part.value
                 }))
             };
 

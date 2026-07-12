@@ -173,7 +173,13 @@ function isSQLiteValue(value: unknown): boolean {
         value === null ||
         typeof value === 'string' ||
         (typeof value === 'number' && Number.isFinite(value)) ||
-        value instanceof Uint8Array
+        value instanceof Uint8Array ||
+        (
+            isRecord(value) &&
+            value.type === 'blob' &&
+            typeof value.base64 === 'string' &&
+            Buffer.from(value.base64, 'base64').toString('base64') === value.base64
+        )
     );
 }
 
