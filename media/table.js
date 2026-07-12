@@ -326,6 +326,8 @@ function createDataTable(data, columns, tableName = "", options = {}) {
     isQueryResult = false, // Whether this is a query result
     query = null, // Original SQL query for result tabs
     allowEditing = null, // Override editing permission
+    rowIdentities = [], // Stable database identities aligned with source rows
+    editError = "", // Explanation shown when safe editing is unavailable
   } = options;
 
   // Create foreign key lookup map
@@ -423,6 +425,7 @@ function createDataTable(data, columns, tableName = "", options = {}) {
     columns,
     startIndex,
     tableName,
+    rowIdentities,
   });
 
   if (virtualize) {
@@ -439,6 +442,7 @@ function createDataTable(data, columns, tableName = "", options = {}) {
         foreignKeyMap,
         options,
         tableName,
+        rowIdentities,
       });
     } catch (_) {
       // ignore stashing errors (best-effort)
@@ -480,7 +484,9 @@ function createDataTable(data, columns, tableName = "", options = {}) {
             isQueryResult
               ? `<span class="table-readonly-indicator" title="Query results are read-only">🧮 Query Result</span>`
               : !isEditable
-              ? `<span class="table-readonly-indicator" title="Table is read-only">🔒 Read-only</span>`
+              ? `<span class="table-readonly-indicator" title="${escapeHtmlFast(
+                  editError || "Table is read-only"
+                )}">🔒 Read-only</span>`
               : ``
           }
           ${
@@ -732,7 +738,7 @@ function renderTableCellHtml(
   let cellContentHtml = "";
   if (cell === null || cell === undefined) {
     cellContentHtml =
-      '<div class="cell-content" data-original-value=""><em>NULL</em></div>';
+      '<div class="cell-content" data-original-value="" data-original-is-null="true"><em>NULL</em></div>';
   } else if (isBlob && blobBytes) {
     const sizeText = formatBytes(blobBytes.length);
     const mime = detectImageMime(blobBytes);
@@ -767,7 +773,7 @@ function renderTableCellHtml(
       raw.length > CELL_ORIGINAL_LIMIT ? ' data-original-truncated="true"' : "";
     cellContentHtml = `<div class="cell-content" data-original-value="${escapeHtmlFast(
       original
-    )}"${truncatedAttr}>${escapeHtmlFast(display)}</div>`;
+    )}" data-original-is-null="false"${truncatedAttr}>${escapeHtmlFast(display)}</div>`;
   }
 
   const cellEditable = isEditable && !isBlob;

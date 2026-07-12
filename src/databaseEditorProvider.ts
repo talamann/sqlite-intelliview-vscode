@@ -1,17 +1,26 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { DatabaseService } from './databaseService';
+import { DatabaseService, RowIdentity } from './databaseService';
 import { DatabaseWatcher } from './databaseWatcher';
 import type { ExtensionToWebviewMessage, WebviewSettingsPayload } from './webviewMessages';
 import { isWebviewToExtensionMessage } from './webviewMessages';
+
+interface TableSyncState {
+    table: string;
+    since: string;
+    page: number;
+    pageSize: number;
+    key?: string;
+    lastPageData?: any[][];
+}
 
 export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvider {
     public static readonly viewType = 'sqlite-intelliview-vscode.databaseEditor';
     private static activeProvider: DatabaseEditorProvider | undefined;
     private activeConnections: Map<string, DatabaseService> = new Map();
     /** Track last sync state per database for delta updates */
-    private lastSync: Map<string, { table: string; since: string; page: number; pageSize: number; lastPageData?: any[][] }> = new Map();
+    private lastSync: Map<string, TableSyncState> = new Map();
     private databaseWatcher: DatabaseWatcher = new DatabaseWatcher();
     private webviewPanels: Map<string, vscode.WebviewPanel> = new Map();
     /** cache full pages keyed by `${db}:${table}:${page}:${pageSize}` → QueryResult.values */
@@ -206,7 +215,7 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 return;
             }
 
-            this.debugLog('onDidReceiveMessage', `Received message type: ${e.type}`, e);
+            this.debugLog('onDidReceiveMessage', `Received message type: ${e.type}`);
             
             switch (e.type) {
                 case 'requestDatabaseInfo':
@@ -236,7 +245,7 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                     this.handleTableDataRequest(webviewPanel, document.uri.fsPath, e.tableName, e.key, e.page, e.pageSize, true);
                     return;
                 case 'updateCellData':
-                    this.handleCellUpdateRequest(webviewPanel, document.uri.fsPath, e.tableName, e.rowIndex, e.columnName, e.newValue, e.key);
+                    this.handleCellUpdateRequest(webviewPanel, document.uri.fsPath, e.tableName, e.requestId, e.rowIdentity, e.columnName, e.newValue, e.key);
                     return;
                 case 'deleteRow':
                     this.debugLog('onDidReceiveMessage', 'Processing deleteRow message');
@@ -625,9 +634,26 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
         }
     }
 
-    private async handleTableDataRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, key?: string, page?: number, pageSize?: number, setSync: boolean = true) {
+    private async handleTableDataRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, key?: string, page?: number, pageSize?: number, setSync: boolean = true, syncToken?: TableSyncState) {
+        const requestToken = syncToken || {
+            table: tableName,
+            since: '',
+            page: page ?? 1,
+            pageSize: pageSize ?? 1000,
+            key
+        };
+        if (!syncToken) {
+            this.lastSync.set(databasePath, requestToken);
+        }
+        const syncIsCurrent = () => this.lastSync.get(databasePath) === requestToken;
         try {
+            if (!syncIsCurrent()) {
+                return;
+            }
             const dbService = await this.getOrCreateConnection(databasePath, key);
+            if (!syncIsCurrent()) {
+                return;
+            }
             
             // Use pagination if provided, otherwise use default behavior
             let result;
@@ -648,6 +674,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                     totalRowsKnown = false;
                     // Compute count in background and update UI when ready
                     dbService.getRowCount(tableName).then(count => {
+                        if (!syncIsCurrent()) {
+                            return;
+                        }
                         this.rowCountCache.set(cacheKey, count);
                         this.postWebviewMessage(webviewPanel.webview, {
                             type: 'tableRowCount',
@@ -665,6 +694,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 totalRowCount = result.values.length;
                 totalRowsKnown = true;
             }
+            if (!syncIsCurrent()) {
+                return;
+            }
 
             // Get foreign key information for the table
             const metaKey = `${databasePath}:${tableName}`;
@@ -672,6 +704,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
             if (foreignKeys.length === 0) {
                 try {
                     foreignKeys = await dbService.getForeignKeys(tableName);
+                    if (!syncIsCurrent()) {
+                        return;
+                    }
                     this.foreignKeysCache.set(metaKey, foreignKeys);
                 } catch (err) {
                     this.debugWarn('getForeignKeys', `Failed to fetch foreign keys for ${tableName}:`, err);
@@ -685,6 +720,9 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
             if (!columnInfo) {
                 // Fill in background; UI doesn't need this to render the page.
                 dbService.getTableInfo(tableName).then(info => {
+                    if (!syncIsCurrent()) {
+                        return;
+                    }
                     this.tableInfoCache.set(metaKey, info as any[]);
                     this.postWebviewMessage(webviewPanel.webview, {
                         type: 'tableColumnInfo',
@@ -696,29 +734,18 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 });
             }
 
-            // Fix column headers: alias rowid as _rowid and remove duplicate id columns
-            let columns = result.columns;
-            let data = result.values;
-            // If first column is rowid and second is id, remove the second if they are identical for all rows
-            if (columns.length > 1 && columns[0].toLowerCase() === 'rowid' && columns[1].toLowerCase() === 'id') {
-                const allMatch = data.every(row => row[0] === row[1]);
-                if (allMatch) {
-                    // Remove the second column (id)
-                    columns = [columns[0], ...columns.slice(2)];
-                    data = data.map(row => [row[0], ...row.slice(2)]);
-                }
+            if (!syncIsCurrent()) {
+                return;
             }
-            // Always alias rowid as _rowid for clarity
-            if (columns[0].toLowerCase() === 'rowid') {
-                columns = ['_rowid', ...columns.slice(1)];
-            }
-
             this.postWebviewMessage(webviewPanel.webview, {
                 type: 'tableData',
                 success: true,
                 tableName,
-                data: data,
-                columns: columns,
+                data: result.values,
+                columns: result.columns,
+                rowIdentities: result.rowIdentities,
+                editable: result.editable,
+                editError: result.editError,
                 foreignKeys: foreignKeys,
                 columnInfo: columnInfo,
                 page: page,
@@ -728,16 +755,19 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
             });
             // cache this page for future diffs ONLY if this is a user-initiated load
             if (setSync) {
-                this.lastSync.set(databasePath, {
-                    table: tableName!,
-                    since: '',
-                    page: page!,
-                    pageSize: pageSize!,
-                    lastPageData: data // <--- store the actual rows
+                requestToken.lastPageData = result.values;
+                this.lastSync.set(databasePath, requestToken);
+                this.debugLog('getTableDataPaginated', 'lastSync set for', databasePath, {
+                    table: tableName,
+                    page,
+                    pageSize,
+                    rowCount: result.values.length
                 });
-                this.debugLog('getTableDataPaginated', 'lastSync set for', databasePath, { table: tableName, page, pageSize, lastPageData: data });
             }
         } catch (error) {
+            if (!syncIsCurrent()) {
+                return;
+            }
             this.postWebviewMessage(webviewPanel.webview, {
                 type: 'error',
                 message: `Failed to load table data: ${error}`
@@ -745,20 +775,10 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
         }
     }
 
-    private async handleCellUpdateRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, rowIndex: number, columnName: string, newValue: any, key?: string) {
-        this.debugLog('handleCellUpdateRequest', `Processing cell update request:`, {
-            tableName, rowIndex, columnName, newValue,
-            databasePath: databasePath.substring(databasePath.lastIndexOf('/') + 1)
-        });
-
+    private async handleCellUpdateRequest(webviewPanel: vscode.WebviewPanel, databasePath: string, tableName: string, requestId: string, rowIdentity: RowIdentity, columnName: string, newValue: unknown, key?: string) {
         try {
             const dbService = await this.getOrCreateConnection(databasePath, key);
-            // First, get the rowid for the row we want to update
-            this.debugLog('handleCellUpdateRequest', `Getting rowid for row index ${rowIndex}`);
-            const rowId = await dbService.getCellRowId(tableName, rowIndex);
-            // Update the cell data
-            this.debugLog('handleCellUpdateRequest', `Updating cell data with rowid ${rowId}`);
-            await dbService.updateCellData(tableName, rowId, columnName, newValue);
+            const updateResult = await dbService.updateCellData(tableName, rowIdentity, columnName, newValue);
 
             // Invalidate caches for this table so subsequent reads are fresh.
             this.invalidateCachesForTable(databasePath, tableName);
@@ -768,12 +788,26 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 type: 'cellUpdateSuccess',
                 success: true,
                 tableName: tableName,
-                rowIndex: rowIndex,
+                requestId,
                 columnName: columnName,
-                newValue: newValue
+                newValue: updateResult.value,
+                rowIdentity: updateResult.identity,
+                changes: updateResult.changes
             });
-            
-            this.debugLog('handleCellUpdateRequest', 'Cell update completed successfully');
+
+            const sync = this.lastSync.get(databasePath);
+            if (sync?.table === tableName) {
+                await this.handleTableDataRequest(
+                    webviewPanel,
+                    databasePath,
+                    tableName,
+                    key,
+                    sync.page,
+                    sync.pageSize,
+                    true,
+                    sync
+                );
+            }
         } catch (error) {
             this.debugError('handleCellUpdateRequest', 'Cell update failed:', error);
             this.postWebviewMessage(webviewPanel.webview, {
@@ -781,7 +815,7 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
                 success: false,
                 message: `Failed to update cell: ${error}`,
                 tableName: tableName,
-                rowIndex: rowIndex,
+                requestId,
                 columnName: columnName
             });
         }
@@ -1089,9 +1123,6 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
 
     private debugLogConnections(): void {
         this.debugLog('Connection', `Active connections (${this.activeConnections.size})`);
-        for (const [key] of this.activeConnections) {
-            this.debugLog('Connection', `Connection Key ${key}`);
-        }
     }
 
     // Add a global cleanup method for extension deactivation
@@ -1102,82 +1133,80 @@ export class DatabaseEditorProvider implements vscode.CustomReadonlyEditorProvid
     }
 
     public async handleExternalDatabaseChange(databasePath: string) {
-        // External changes can modify data and schema; clear all cached metadata/counts for this DB.
-        this.invalidateCachesForDatabase(databasePath);
+        let panel: vscode.WebviewPanel | undefined;
+        let sync: TableSyncState | undefined;
 
-        this.closeConnection(databasePath);
-        const panel = this.webviewPanels.get(databasePath);
-        const sync = this.lastSync.get(databasePath);
-        this.debugLog('DatabaseChange', `[handleExternalDatabaseChange] Triggered for ${databasePath}`, { hasPanel: !!panel, hasSync: !!sync });
-        if (!panel || !sync) {
-            this.debugWarn('DatabaseChange', `[handleExternalDatabaseChange] No panel or sync found for ${databasePath}`, { panel, sync });
-            return;
-        }
-        const { table, page, pageSize, lastPageData } = sync;
-        this.debugLog('DatabaseChange', '[handleExternalDatabaseChange] Using sync state', { table, page, pageSize });
-        const db = await this.getOrCreateConnection(databasePath);
-        const newResult = await db.getTableDataPaginated(table, page, pageSize);
-        const newTotalCount = await db.getRowCount(table);
-        this.rowCountCache.set(this.getTableCacheKey(databasePath, table), newTotalCount);
-        this.debugLog('DatabaseChange', 'New page data fetched', { rowCount: newResult.values.length, newTotalCount });
-        const oldRows = lastPageData || [];
-        const newRows = newResult.values;
-        const baseIndex = (page - 1) * pageSize;
-        const oldMap = new Map();
-        oldRows.forEach((r, i) => oldMap.set(r[0], JSON.stringify(r)));
-        const newMap = new Map();
-        newRows.forEach((r, i) => newMap.set(r[0], JSON.stringify(r)));
-        const deletes: number[] = [];
-        for (const [rowid, _] of oldMap) {
-            if (!newMap.has(rowid)) {
-                const localIdx = oldRows.findIndex(r => r[0] === rowid);
-                deletes.push(baseIndex + localIdx);
+        try {
+            panel = this.webviewPanels.get(databasePath);
+            sync = this.lastSync.get(databasePath);
+            // External changes can modify data and schema; clear all cached metadata/counts for this DB.
+            this.invalidateCachesForDatabase(databasePath);
+            this.closeConnection(databasePath);
+            this.debugLog('DatabaseChange', `[handleExternalDatabaseChange] Triggered for ${databasePath}`, { hasPanel: !!panel, hasSync: !!sync });
+            if (!panel || !sync) {
+                this.debugWarn('DatabaseChange', `[handleExternalDatabaseChange] No panel or sync found for ${databasePath}`, { hasPanel: !!panel, hasSync: !!sync });
+                return;
+            }
+
+            const { table, page, pageSize, key } = sync;
+            this.debugLog('DatabaseChange', '[handleExternalDatabaseChange] Using sync state', { table, page, pageSize });
+            const db = await this.getOrCreateConnection(databasePath, key);
+            const newResult = await db.getTableDataPaginated(table, page, pageSize);
+            const newTotalCount = await db.getRowCount(table);
+            const [foreignKeys, columnInfo] = await Promise.all([
+                db.getForeignKeys(table),
+                db.getTableInfo(table)
+            ]);
+            if (this.lastSync.get(databasePath) !== sync) {
+                this.debugLog('DatabaseChange', `Discarding stale refresh result for ${databasePath}`);
+                return;
+            }
+            this.rowCountCache.set(this.getTableCacheKey(databasePath, table), newTotalCount);
+            this.debugLog('DatabaseChange', 'New page data fetched', { rowCount: newResult.values.length, newTotalCount });
+            await this.postWebviewMessage(panel.webview, {
+                type: 'tableData',
+                success: true,
+                tableName: table,
+                data: newResult.values,
+                columns: newResult.columns,
+                rowIdentities: newResult.rowIdentities,
+                editable: newResult.editable,
+                editError: newResult.editError,
+                foreignKeys,
+                columnInfo,
+                page,
+                pageSize,
+                totalRows: newTotalCount,
+                totalRowsKnown: true
+            });
+            if (this.lastSync.get(databasePath) !== sync) {
+                this.debugLog('DatabaseChange', `Discarding stale refresh state for ${databasePath}`);
+                return;
+            }
+            sync.lastPageData = newResult.values;
+            this.lastSync.set(databasePath, sync);
+            this.debugLog('DatabaseChange', 'lastPageData updated in lastSync', {
+                databasePath,
+                rowCount: sync.lastPageData.length
+            });
+        } catch (error) {
+            const syncIsCurrent = sync && this.lastSync.get(databasePath) === sync;
+            if (sync && syncIsCurrent) {
+                sync.lastPageData = undefined;
+                this.lastSync.set(databasePath, sync);
+            }
+            this.debugError('DatabaseChange', `Failed to refresh ${databasePath}:`, error);
+            if (panel && syncIsCurrent) {
+                try {
+                    await this.postWebviewMessage(panel.webview, {
+                        type: 'error',
+                        message: `Failed to refresh database: ${error}`
+                    });
+                } catch (notificationError) {
+                    this.debugWarn('DatabaseChange', 'Failed to notify webview about refresh failure:', notificationError);
+                }
             }
         }
-        const inserts: { rowIndex: number; rowData: any[] }[] = [];
-        newRows.forEach((r, i) => {
-            if (!oldMap.has(r[0])) {
-                inserts.push({ rowIndex: baseIndex + i, rowData: r });
-            }
-        });
-        const updates: { rowIndex: number; rowData: any[] }[] = [];
-        newRows.forEach((r, i) => {
-            const rowid = r[0], payload = JSON.stringify(r);
-            if (oldMap.has(rowid) && oldMap.get(rowid) !== payload) {
-                updates.push({ rowIndex: baseIndex + i, rowData: r });
-            }
-        });
-        const hasDelta = inserts.length > 0 || updates.length > 0 || deletes.length > 0;
-        this.debugLog('DatabaseChange', 'Delta computed', {
-            inserts: inserts.length,
-            updates: updates.length,
-            deletes: deletes.length
-        });
-        if (hasDelta) {
-            this.debugLog('DatabaseChange', 'Old Rows', JSON.stringify(oldRows));
-            this.debugLog('DatabaseChange', 'New Rows', JSON.stringify(newRows));
-        }
-        this.postWebviewMessage(panel.webview, {
-            type: 'tableDataDelta',
-            tableName: table,
-            inserts,
-            updates,
-            deletes,
-            totalCount: newTotalCount
-        });
-        this.debugLog('DatabaseChange', 'tableDataDelta sent to webview', {
-            table,
-            inserts: inserts.length,
-            updates: updates.length,
-            deletes: deletes.length,
-            totalCount: newTotalCount
-        });
-        sync.lastPageData = newRows;
-        this.lastSync.set(databasePath, sync);
-        this.debugLog('DatabaseChange', 'lastPageData updated in lastSync', {
-            databasePath,
-            rowCount: sync.lastPageData.length
-        });
     }
 }
 

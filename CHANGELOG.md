@@ -7,6 +7,12 @@
 - Built-in recognition for `.db3`, `.s3db`, and `.sl3` databases, with case-insensitive matching for all supported SQLite extensions.
 - `sqliteIntelliView.additionalFileExtensions` for recognizing custom SQLite filename extensions in commands and file pickers.
 
+### Fixed
+
+- Fixed a critical data-integrity bug where cell edits could update a different database row when grid position and SQLite scan order diverged after sorting, filtering, pagination, or virtual scrolling.
+- Cell updates now use stable declared primary-key identities (including text and composite keys) or SQLite `rowid`, bind all values, and require exactly one changed row before reporting success.
+- **Breaking:** Tables for which SQLite IntelliView cannot derive a stable row identity are now read-only instead of allowing potentially unsafe edits. Normal `rowid` tables remain editable. For tables whose SQLite `rowid` aliases are shadowed, define a non-null primary key to restore editing. Views remain read-only. Primary-key edits retain the original identity for the update and refresh it after saving.
+
 ## [0.4.9] - 2026-04-27
 
 ### Changed

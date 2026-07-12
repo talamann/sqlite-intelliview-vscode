@@ -43,6 +43,47 @@ export interface QueryResult {
     values: any[][];
 }
 
+export type SQLiteValue = number | string | Uint8Array | null;
+
+export interface SerializedBlobIdentityValue {
+    type: 'blob';
+    base64: string;
+}
+
+export type RowIdentityValue = SQLiteValue | SerializedBlobIdentityValue;
+
+export interface RowIdentityPart {
+    column: string;
+    value: RowIdentityValue;
+}
+
+export interface RowIdentity {
+    kind: 'primaryKey' | 'rowid';
+    parts: RowIdentityPart[];
+}
+
+export interface EditableTableData extends QueryResult {
+    rowIdentities: Array<RowIdentity | null>;
+    editable: boolean;
+    editError?: string;
+}
+
+export interface CellUpdateResult {
+    changes: number;
+    identity: RowIdentity;
+    value: SQLiteValue;
+}
+
+interface TableIdentityDefinition {
+    kind: 'primaryKey' | 'rowid';
+    columns: string[];
+}
+
+interface TableEditability {
+    definition: TableIdentityDefinition | null;
+    reason?: string;
+}
+
 /** 
  * A single change in a table since our last sync.
  */
@@ -60,6 +101,7 @@ export class DatabaseService {
     private tempDecryptedPath: string | null = null;
     private currentDatabasePath: string | null = null;
     private currentEncryptionKey: string | null = null;
+    private editQueue: Promise<void> = Promise.resolve();
     private isDevelopment = process.env.NODE_ENV === 'development' || (typeof process !== 'undefined' && process.env.VSCODE_PID !== undefined);
 
     private debugLog(component: string, message: string, ...args: any[]): void {
@@ -82,6 +124,43 @@ export class DatabaseService {
 
     private quoteIdentifier(identifier: string): string {
         return `"${identifier.replace(/"/g, '""')}"`;
+    }
+
+    private serializeIdentityValue(value: unknown): RowIdentityValue {
+        if (typeof value === 'bigint') {
+            const numericValue = Number(value);
+            return Number.isSafeInteger(numericValue) ? numericValue : value.toString();
+        }
+        if (value instanceof Uint8Array) {
+            return { type: 'blob', base64: Buffer.from(value).toString('base64') };
+        }
+        if (value === null || typeof value === 'string') {
+            return value;
+        }
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return value;
+        }
+        throw new Error('Row identity contains an unsupported SQLite value.');
+    }
+
+    private deserializeIdentityValue(value: RowIdentityValue): SQLiteValue {
+        if (typeof value === 'object' && value !== null && !(value instanceof Uint8Array)) {
+            if (value.type !== 'blob' || typeof value.base64 !== 'string') {
+                throw new Error('Row identity contains an invalid serialized BLOB value.');
+            }
+            const decoded = Buffer.from(value.base64, 'base64');
+            if (decoded.toString('base64') !== value.base64) {
+                throw new Error('Row identity contains an invalid base64 BLOB value.');
+            }
+            return new Uint8Array(decoded);
+        }
+        return value;
+    }
+
+    private enqueueEdit<T>(operation: () => Promise<T>): Promise<T> {
+        const queued = this.editQueue.then(operation, operation);
+        this.editQueue = queued.then(() => undefined, () => undefined);
+        return queued;
     }
 
     private getSettings() {
@@ -472,81 +551,339 @@ export class DatabaseService {
         }
     }
 
-    async getTableData(tableName: string, limit: number = 1000, offset: number = 0): Promise<QueryResult> {
-        const query = `SELECT * FROM "${tableName}" LIMIT ${limit} OFFSET ${offset}`;
-        return this.executeQuery(query);
+    async getTableData(tableName: string, limit: number = 1000, offset: number = 0): Promise<EditableTableData> {
+        return this.getTableDataWithIdentities(tableName, limit, offset);
     }
 
-    public async getTableDataPaginated(tableName: string, page: number = 1, pageSize: number = 100): Promise<QueryResult> {
-        const offset = (page - 1) * pageSize;
-        const query = `SELECT * FROM "${tableName}" LIMIT ${pageSize} OFFSET ${offset}`;
-        return this.executeQuery(query);
+    public async getTableDataPaginated(tableName: string, page: number = 1, pageSize: number = 100): Promise<EditableTableData> {
+        const safePage = Number.isInteger(page) && page > 0 ? page : 1;
+        const safePageSize = Number.isInteger(pageSize) && pageSize > 0 ? Math.min(pageSize, 100000) : 100;
+        const offset = (safePage - 1) * safePageSize;
+        return this.getTableDataWithIdentities(tableName, safePageSize, offset);
     }
 
     async getRowCount(tableName: string): Promise<number> {
-        const result = await this.executeQuery(`SELECT COUNT(*) as count FROM "${tableName}"`);
+        const result = await this.executeQuery(`SELECT COUNT(*) as count FROM ${this.quoteIdentifier(tableName)}`);
         return result.values[0][0] as number;
     }
 
-    async updateCellData(tableName: string, rowId: any, columnName: string, newValue: any): Promise<void> {
+    private async getTableEditability(tableName: string): Promise<TableEditability> {
         if (!this.db) {
             throw new Error('Database not opened');
         }
 
-        this.debugLog('CellUpdate', 'Starting cell update:', {
-            tableName,
-            rowId,
-            columnName,
-            newValue,
-            newValueType: typeof newValue
+        const tableStmt = this.db.prepare(`
+            SELECT type, sql
+            FROM sqlite_master
+            WHERE name = ? AND type IN ('table', 'view')
+            LIMIT 1
+        `);
+        tableStmt.bind([tableName]);
+        const found = tableStmt.step();
+        const table = found ? tableStmt.getAsObject() : null;
+        tableStmt.free();
+
+        if (!table) {
+            return { definition: null, reason: `Table ${tableName} no longer exists.` };
+        }
+        if (table.type !== 'table') {
+            return { definition: null, reason: 'Views cannot be edited safely because they do not expose stable row identity.' };
+        }
+
+        const infoStmt = this.db.prepare(`PRAGMA table_info(${this.quoteIdentifier(tableName)})`);
+        const columns: Array<{ name: string; notNull: boolean; pkOrder: number }> = [];
+        while (infoStmt.step()) {
+            const row = infoStmt.getAsObject();
+            columns.push({
+                name: row.name as string,
+                notNull: Boolean(row.notnull),
+                pkOrder: Number(row.pk) || 0
+            });
+        }
+        infoStmt.free();
+
+        const createSql = typeof table.sql === 'string' ? table.sql : '';
+        const withoutRowid = /\bWITHOUT\s+ROWID\b/i.test(createSql);
+        const primaryKeyColumns = columns
+            .filter(column => column.pkOrder > 0)
+            .sort((a, b) => a.pkOrder - b.pkOrder);
+        const indexStmt = this.db.prepare(`PRAGMA index_list(${this.quoteIdentifier(tableName)})`);
+        let hasPrimaryKeyIndex = false;
+        while (indexStmt.step()) {
+            if (indexStmt.getAsObject().origin === 'pk') {
+                hasPrimaryKeyIndex = true;
+                break;
+            }
+        }
+        indexStmt.free();
+        const primaryKeyIsRowidAlias = primaryKeyColumns.length === 1 && !hasPrimaryKeyIndex;
+        const primaryKeyIsNonNull = withoutRowid || primaryKeyIsRowidAlias || primaryKeyColumns.every(column => column.notNull);
+        if (primaryKeyColumns.length > 0 && primaryKeyIsNonNull) {
+            return {
+                definition: {
+                    kind: 'primaryKey',
+                    columns: primaryKeyColumns.map(column => column.name)
+                }
+            };
+        }
+
+        if (withoutRowid) {
+            return {
+                definition: null,
+                reason: 'This WITHOUT ROWID table has no declared primary key and cannot be edited safely.'
+            };
+        }
+
+        const declaredNames = new Set(columns.map(column => column.name.toLowerCase()));
+        const rowidAlias = ['rowid', '_rowid_', 'oid'].find(alias => !declaredNames.has(alias));
+        if (!rowidAlias) {
+            return {
+                definition: null,
+                reason: 'This table has no declared primary key and all SQLite rowid aliases are shadowed.'
+            };
+        }
+
+        return {
+            definition: {
+                kind: 'rowid',
+                columns: [rowidAlias]
+            }
+        };
+    }
+
+    private async getTableDataWithIdentities(tableName: string, limit: number, offset: number): Promise<EditableTableData> {
+        if (!this.db) {
+            throw new Error('Database not opened');
+        }
+
+        const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 100000) : 1000;
+        const safeOffset = Number.isInteger(offset) && offset >= 0 ? offset : 0;
+        const editability = await this.getTableEditability(tableName);
+        const definition = editability.definition;
+        const hiddenIdentity = definition?.kind === 'rowid';
+        const identitySelection = hiddenIdentity
+            ? `${this.quoteIdentifier(definition.columns[0])} AS ${this.quoteIdentifier('__intelliview_row_identity__')}, `
+            : '';
+        const identityOrder = definition
+            ? ` ORDER BY ${definition.columns.map(column => this.quoteIdentifier(column)).join(', ')}`
+            : '';
+        const query = `SELECT ${identitySelection}* FROM ${this.quoteIdentifier(tableName)}${identityOrder} LIMIT ? OFFSET ?`;
+        const stmt = this.db.prepare(query);
+        stmt.bind([safeLimit, safeOffset]);
+
+        let columns = stmt.getColumnNames();
+        const rawRows: any[][] = [];
+        const identityRows: Array<Array<SQLiteValue | bigint>> = [];
+        while (stmt.step()) {
+            const identityRow = stmt.get(null, { useBigInt: true }) as Array<SQLiteValue | bigint>;
+            identityRows.push(identityRow);
+            rawRows.push(identityRow.map(value => {
+                if (typeof value !== 'bigint') {
+                    return value;
+                }
+                const numericValue = Number(value);
+                return Number.isSafeInteger(numericValue) ? numericValue : value.toString();
+            }));
+        }
+        stmt.free();
+
+        if (hiddenIdentity) {
+            columns = columns.slice(1);
+        }
+
+        const values = hiddenIdentity ? rawRows.map(row => row.slice(1)) : rawRows;
+        const rowIdentities: Array<RowIdentity | null> = identityRows.map(row => {
+            if (!definition) {
+                return null;
+            }
+            if (definition.kind === 'rowid') {
+                return {
+                    kind: 'rowid',
+                    parts: [{ column: definition.columns[0], value: this.serializeIdentityValue(row[0]) }]
+                };
+            }
+
+            return {
+                kind: 'primaryKey',
+                parts: definition.columns.map(column => {
+                    const columnIndex = columns.indexOf(column);
+                    if (columnIndex < 0) {
+                        throw new Error(`Primary-key column ${column} is missing from the table result.`);
+                    }
+                    return { column, value: this.serializeIdentityValue(row[columnIndex]) };
+                })
+            };
         });
 
-        // Sanitize inputs
-        const sanitizedTableName = tableName.replace(/"/g, '""');
-        const sanitizedColumnName = columnName.replace(/"/g, '""');
-        
-        // Build the UPDATE query
-        const updateQuery = `UPDATE "${sanitizedTableName}" SET "${sanitizedColumnName}" = ? WHERE rowid = ?`;
-        
-        try {
-            const stmt = this.db.prepare(updateQuery);
-            
-            // Convert the new value to the appropriate type
-            let processedValue = newValue;
-            if (newValue === '' || newValue === null) {
-                processedValue = null;
-            } else if (typeof newValue === 'string') {
-                // Try to parse as number if it looks like a number
-                const numValue = parseFloat(newValue);
-                if (!isNaN(numValue) && isFinite(numValue) && newValue.trim() === numValue.toString()) {
-                    processedValue = numValue;
+        return {
+            columns,
+            values,
+            rowIdentities,
+            editable: definition !== null,
+            editError: editability.reason
+        };
+    }
+
+    private processEditedValue(newValue: unknown): SQLiteValue {
+        if (newValue === null) {
+            return null;
+        }
+        if (typeof newValue === 'string') {
+            const numValue = Number(newValue);
+            if (Number.isFinite(numValue) && newValue.trim() !== '' && newValue.trim() === String(numValue)) {
+                if (Number.isInteger(numValue) && !Number.isSafeInteger(numValue)) {
+                    return newValue;
                 }
+                return numValue;
             }
-            
-            this.debugLog('CellUpdate', 'Executing query:', updateQuery);
-            this.debugLog('CellUpdate', 'Parameters:', [processedValue, rowId]);
-            
-            stmt.run([processedValue, rowId]);
+            return newValue;
+        }
+        if (typeof newValue === 'number' && Number.isFinite(newValue)) {
+            return newValue;
+        }
+        if (newValue instanceof Uint8Array) {
+            return newValue;
+        }
+        throw new Error('The edited value is not a supported SQLite value.');
+    }
+
+    async updateCellData(tableName: string, identity: RowIdentity, columnName: string, newValue: unknown): Promise<CellUpdateResult> {
+        return this.enqueueEdit(() => this.updateCellDataSerialized(tableName, identity, columnName, newValue));
+    }
+
+    private async updateCellDataSerialized(tableName: string, identity: RowIdentity, columnName: string, newValue: unknown): Promise<CellUpdateResult> {
+        if (!this.db) {
+            throw new Error('Database not opened');
+        }
+
+        const editability = await this.getTableEditability(tableName);
+        const definition = editability.definition;
+        if (!definition) {
+            throw new Error(editability.reason || 'This row cannot be identified safely and uniquely.');
+        }
+
+        const tableInfo = await this.getTableInfo(tableName);
+        if (!tableInfo.some(column => column.name === columnName)) {
+            throw new Error(`Column ${columnName} does not exist in table ${tableName}.`);
+        }
+        if (!identity || identity.kind !== definition.kind || !Array.isArray(identity.parts)) {
+            throw new Error('The selected row identity is missing or no longer matches the table schema. Refresh the table and try again.');
+        }
+        const suppliedColumns = identity.parts.map(part => part?.column);
+        if (
+            suppliedColumns.length !== definition.columns.length ||
+            suppliedColumns.some((column, index) => column !== definition.columns[index]) ||
+            identity.parts.some(part => !part || part.value === undefined)
+        ) {
+            throw new Error('The selected row identity is incomplete or no longer matches the table schema. Refresh the table and try again.');
+        }
+
+        const processedValue = this.processEditedValue(newValue);
+        const whereClause = definition.columns
+            .map(column => `${this.quoteIdentifier(column)} IS ?`)
+            .join(' AND ');
+        const updateQuery = `UPDATE ${this.quoteIdentifier(tableName)} SET ${this.quoteIdentifier(columnName)} = ? WHERE ${whereClause}`;
+        const parameters = [processedValue, ...identity.parts.map(part => this.deserializeIdentityValue(part.value))];
+        let stmt: any = null;
+        let transactionOpen = false;
+        let committed = false;
+        let persistenceComplete = false;
+        let databaseStateBeforeUpdate: Uint8Array | undefined;
+        let fileStateBeforeUpdate: Buffer | undefined;
+
+        try {
+            databaseStateBeforeUpdate = this.db.export();
+            this.db.run('BEGIN IMMEDIATE TRANSACTION');
+            transactionOpen = true;
+            stmt = this.db.prepare(updateQuery);
+            stmt.run(parameters);
             stmt.free();
-            
-            this.debugLog('CellUpdate', `Successfully updated ${tableName}.${columnName} = ${processedValue} where rowid = ${rowId}`);
-            
-            // CRITICAL: Save changes back to the database file
-            await this.saveChangesToFile();
-            // Mark as internal update so watcher ignores this event
+            stmt = null;
+
+            const changes = Number(this.db.getRowsModified());
+            if (changes === 0) {
+                throw new Error('No row was updated. The record may have changed or been deleted; refresh the table and try again.');
+            }
+            if (changes !== 1) {
+                throw new Error(`Critical update failure: expected one changed row but SQLite reported ${changes}. The update was rolled back.`);
+            }
+
+            fileStateBeforeUpdate = this.captureFileState();
+            this.db.run('COMMIT');
+            transactionOpen = false;
+            committed = true;
+
+            const nextIdentity: RowIdentity = {
+                kind: identity.kind,
+                parts: identity.parts.map(part => ({
+                    column: part.column,
+                    value: part.column === columnName ? this.serializeIdentityValue(processedValue) : part.value
+                }))
+            };
+
+            const databaseStateAfterUpdate = this.db.export();
+            await this.saveChangesToFile(databaseStateAfterUpdate);
+            persistenceComplete = true;
             if (this.currentDatabasePath) {
                 markInternalUpdate(this.currentDatabasePath);
             }
-            
-            this.debugLog('CellUpdate', 'Cell update completed successfully');
-            
+
+            return {
+                changes,
+                identity: nextIdentity,
+                value: processedValue
+            };
         } catch (error) {
-            this.debugError('CellUpdate', 'Failed to update cell:', error);
+            if (stmt) {
+                stmt.free();
+            }
+            let restoreSnapshot = committed && !persistenceComplete;
+            if (transactionOpen) {
+                try {
+                    this.db.run('ROLLBACK');
+                } catch {
+                    restoreSnapshot = true;
+                } finally {
+                    transactionOpen = false;
+                }
+            }
+            if (restoreSnapshot && databaseStateBeforeUpdate) {
+                try {
+                    this.restoreDatabaseState(databaseStateBeforeUpdate, fileStateBeforeUpdate);
+                } catch (restoreError) {
+                    throw new Error(`Failed to update cell: ${error}. Failed to restore the previous database state: ${restoreError}`);
+                }
+            }
             throw new Error(`Failed to update cell: ${error}`);
         }
     }
 
+    private captureFileState(): Buffer {
+        if (!this.currentDatabasePath) {
+            throw new Error('No database path available for saving');
+        }
+
+        return fs.readFileSync(this.currentDatabasePath);
+    }
+
+    private restoreDatabaseState(databaseState: Uint8Array, fileState?: Buffer): void {
+        const modifiedDatabase = this.db;
+        this.db = new this.SQL.Database(databaseState);
+        modifiedDatabase?.close();
+
+        if (this.currentDatabasePath && fileState) {
+            fs.writeFileSync(this.currentDatabasePath, fileState);
+        }
+        if (this.tempDecryptedPath) {
+            fs.writeFileSync(this.tempDecryptedPath, Buffer.from(databaseState));
+        }
+    }
+
     async deleteRow(tableName: string, rowIdentifier: any): Promise<void> {
+        return this.enqueueEdit(() => this.deleteRowSerialized(tableName, rowIdentifier));
+    }
+
+    private async deleteRowSerialized(tableName: string, rowIdentifier: any): Promise<void> {
         if (!this.db) {
             throw new Error('Database not opened');
         }
@@ -558,6 +895,13 @@ export class DatabaseService {
 
         // Sanitize table name
         const sanitizedTableName = tableName.replace(/"/g, '""');
+        let stmt: any = null;
+        let countStmt: any = null;
+        let transactionOpen = false;
+        let committed = false;
+        let persistenceComplete = false;
+        let databaseStateBeforeDelete: Uint8Array | undefined;
+        let fileStateBeforeDelete: Buffer | undefined;
         
         try {
             let deleteQuery: string;
@@ -597,24 +941,43 @@ export class DatabaseService {
             
             this.debugLog('DeleteRow', 'Executing query:', deleteQuery);
             this.debugLog('DeleteRow', 'Parameters:', parameters);
-            
-            const stmt = this.db.prepare(deleteQuery);
+
+            databaseStateBeforeDelete = this.db.export();
+            this.db.run('BEGIN IMMEDIATE TRANSACTION');
+            transactionOpen = true;
+            stmt = this.db.prepare(deleteQuery);
             stmt.run(parameters);
             stmt.free();
+            stmt = null;
+
+            const changes = Number(this.db.getRowsModified());
+            if (changes === 0) {
+                throw new Error('No row was deleted. The record may have changed or already been deleted; refresh the table and try again.');
+            }
+            if (changes !== 1) {
+                throw new Error(`Critical delete failure: expected one changed row but SQLite reported ${changes}. The deletion was rolled back.`);
+            }
             
             this.debugLog('DeleteRow', 'Delete query executed successfully');
             
             // Verify the deletion by checking row count
             const countQuery = `SELECT COUNT(*) as count FROM "${sanitizedTableName}"`;
-            const countStmt = this.db.prepare(countQuery);
+            countStmt = this.db.prepare(countQuery);
             const countResult = countStmt.step();
             const rowCount = countResult ? countStmt.get()[0] : 0;
             countStmt.free();
+            countStmt = null;
             
             this.debugLog('DeleteRow', `Rows remaining in table: ${rowCount}`);
             
-            // CRITICAL: Save changes back to the database file
-            await this.saveChangesToFile();
+            fileStateBeforeDelete = this.captureFileState();
+            this.db.run('COMMIT');
+            transactionOpen = false;
+            committed = true;
+
+            const databaseStateAfterDelete = this.db.export();
+            await this.saveChangesToFile(databaseStateAfterDelete);
+            persistenceComplete = true;
             // Mark as internal update so watcher ignores this event
             if (this.currentDatabasePath) {
                 markInternalUpdate(this.currentDatabasePath);
@@ -623,6 +986,25 @@ export class DatabaseService {
             this.debugLog('DeleteRow', 'Row deletion completed successfully');
             
         } catch (error) {
+            stmt?.free();
+            countStmt?.free();
+            let restoreSnapshot = committed && !persistenceComplete;
+            if (transactionOpen) {
+                try {
+                    this.db.run('ROLLBACK');
+                } catch {
+                    restoreSnapshot = true;
+                } finally {
+                    transactionOpen = false;
+                }
+            }
+            if (restoreSnapshot && databaseStateBeforeDelete) {
+                try {
+                    this.restoreDatabaseState(databaseStateBeforeDelete, fileStateBeforeDelete);
+                } catch (restoreError) {
+                    throw new Error(`Failed to delete row: ${error}. Failed to restore the previous database state: ${restoreError}`);
+                }
+            }
             this.debugError('DeleteRow', 'Failed to delete row:', error);
             throw new Error(`Failed to delete row: ${error}`);
         }
@@ -631,7 +1013,7 @@ export class DatabaseService {
     /**
      * Save changes from the in-memory database back to the file
      */
-    private async saveChangesToFile(): Promise<void> {
+    private async saveChangesToFile(databaseState?: Uint8Array): Promise<void> {
         if (!this.db) {
             throw new Error('Database not opened');
         }
@@ -641,8 +1023,8 @@ export class DatabaseService {
         this.debugLog('SaveFile', `Temp decrypted path: ${this.tempDecryptedPath}`);
 
         try {
-            // Export the current database state
-            const data = this.db.export();
+            // Reuse the caller's committed export when available.
+            const data = databaseState ?? this.db.export();
             const buffer = Buffer.from(data);
             
             this.debugLog('SaveFile', `Exported ${buffer.length} bytes`);
@@ -709,35 +1091,18 @@ export class DatabaseService {
             // Replace the original file with the new encrypted version
             fs.copyFileSync(tempEncryptedFile, originalPath);
             
-            // Clean up temporary encrypted file
-            fs.unlinkSync(tempEncryptedFile);
+            // Cleanup failure does not invalidate the successfully replaced database.
+            try {
+                fs.unlinkSync(tempEncryptedFile);
+            } catch (error) {
+                this.debugWarn('ReEncrypt', `Failed to remove temporary encrypted file ${tempEncryptedFile}:`, error);
+            }
             
             this.debugLog('ReEncrypt', 'Database re-encrypted successfully');
             
         } catch (error) {
             this.debugError('ReEncrypt', 'Re-encryption error:', error);
             throw new Error(`Failed to re-encrypt database: ${error}`);
-        }
-    }
-
-    async getCellRowId(tableName: string, rowIndex: number): Promise<any> {
-        if (!this.db) {
-            throw new Error('Database not opened');
-        }
-
-        const sanitizedTableName = tableName.replace(/"/g, '""');
-        const query = `SELECT rowid FROM "${sanitizedTableName}" LIMIT 1 OFFSET ${rowIndex}`;
-        
-        try {
-            const result = await this.executeQuery(query);
-            
-            if (result.values.length > 0) {
-                const rowId = result.values[0][0];
-                return rowId;
-            }
-            throw new Error('Row not found');
-        } catch (error) {
-            throw new Error(`Failed to get row ID: ${error}`);
         }
     }
 
