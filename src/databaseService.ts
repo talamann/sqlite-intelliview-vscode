@@ -925,6 +925,14 @@ export class DatabaseService {
             stmt.run(parameters);
             stmt.free();
             stmt = null;
+
+            const changes = Number(this.db.getRowsModified());
+            if (changes === 0) {
+                throw new Error('No row was deleted. The record may have changed or already been deleted; refresh the table and try again.');
+            }
+            if (changes !== 1) {
+                throw new Error(`Critical delete failure: expected one changed row but SQLite reported ${changes}. The deletion was rolled back.`);
+            }
             
             this.debugLog('DeleteRow', 'Delete query executed successfully');
             

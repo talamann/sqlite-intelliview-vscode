@@ -406,6 +406,41 @@ suite('Stable cell editing', () => {
         ]);
     });
 
+    test('rolls back deletes unless exactly one row matches', async () => {
+        createDatabase(`
+            CREATE TABLE records (id INTEGER PRIMARY KEY, category TEXT, value TEXT);
+            INSERT INTO records VALUES (1, 'duplicate', 'one'), (2, 'duplicate', 'two'), (3, 'unique', 'three');
+        `);
+        await service.openDatabase(databasePath);
+        const saveChangesToFile = (service as any).saveChangesToFile.bind(service);
+        let persistenceAttempts = 0;
+        (service as any).saveChangesToFile = async (databaseState?: Uint8Array) => {
+            persistenceAttempts++;
+            await saveChangesToFile(databaseState);
+        };
+
+        await assert.rejects(
+            service.deleteRow('records', { column: 'category', value: 'duplicate' }),
+            /expected one changed row but SQLite reported 2/
+        );
+        await assert.rejects(
+            service.deleteRow('records', { column: 'id', value: 99 }),
+            /No row was deleted/
+        );
+
+        assert.strictEqual(persistenceAttempts, 0);
+        assert.deepStrictEqual((await service.getTableData('records')).values, [
+            [1, 'duplicate', 'one'],
+            [2, 'duplicate', 'two'],
+            [3, 'unique', 'three']
+        ]);
+        assert.deepStrictEqual(readRows('SELECT id, category, value FROM records ORDER BY id'), [
+            { id: 1, category: 'duplicate', value: 'one' },
+            { id: 2, category: 'duplicate', value: 'two' },
+            { id: 3, category: 'unique', value: 'three' }
+        ]);
+    });
+
     test('serializes persistence for concurrent updates and deletes', async () => {
         createDatabase(`
             CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT);
