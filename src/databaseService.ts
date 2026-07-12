@@ -768,6 +768,7 @@ export class DatabaseService {
         let fileStateBeforeUpdate: Buffer | undefined;
 
         try {
+            databaseStateBeforeUpdate = this.db.export();
             this.db.run('BEGIN IMMEDIATE TRANSACTION');
             transactionOpen = true;
             stmt = this.db.prepare(updateQuery);
@@ -783,7 +784,7 @@ export class DatabaseService {
                 throw new Error(`Critical update failure: expected one changed row but SQLite reported ${changes}. The update was rolled back.`);
             }
 
-            ({ databaseState: databaseStateBeforeUpdate, fileState: fileStateBeforeUpdate } = this.capturePersistenceSnapshot());
+            fileStateBeforeUpdate = this.captureFileState();
             this.db.run('COMMIT');
             transactionOpen = false;
             committed = true;
@@ -822,9 +823,6 @@ export class DatabaseService {
                     transactionOpen = false;
                 }
             }
-            if (restoreSnapshot && !databaseStateBeforeUpdate) {
-                ({ databaseState: databaseStateBeforeUpdate, fileState: fileStateBeforeUpdate } = this.capturePersistenceSnapshot());
-            }
             if (restoreSnapshot && databaseStateBeforeUpdate) {
                 try {
                     this.restoreDatabaseState(databaseStateBeforeUpdate, fileStateBeforeUpdate);
@@ -836,16 +834,12 @@ export class DatabaseService {
         }
     }
 
-    private capturePersistenceSnapshot(): { databaseState: Uint8Array; fileState: Buffer } {
+    private captureFileState(): Buffer {
         if (!this.currentDatabasePath) {
             throw new Error('No database path available for saving');
         }
 
-        const fileState = fs.readFileSync(this.currentDatabasePath);
-        const databaseState = this.tempDecryptedPath
-            ? fs.readFileSync(this.tempDecryptedPath)
-            : fileState;
-        return { databaseState, fileState };
+        return fs.readFileSync(this.currentDatabasePath);
     }
 
     private restoreDatabaseState(databaseState: Uint8Array, fileState?: Buffer): void {
@@ -924,6 +918,7 @@ export class DatabaseService {
             this.debugLog('DeleteRow', 'Executing query:', deleteQuery);
             this.debugLog('DeleteRow', 'Parameters:', parameters);
 
+            databaseStateBeforeDelete = this.db.export();
             this.db.run('BEGIN IMMEDIATE TRANSACTION');
             transactionOpen = true;
             stmt = this.db.prepare(deleteQuery);
@@ -943,7 +938,7 @@ export class DatabaseService {
             
             this.debugLog('DeleteRow', `Rows remaining in table: ${rowCount}`);
             
-            ({ databaseState: databaseStateBeforeDelete, fileState: fileStateBeforeDelete } = this.capturePersistenceSnapshot());
+            fileStateBeforeDelete = this.captureFileState();
             this.db.run('COMMIT');
             transactionOpen = false;
             committed = true;
@@ -970,9 +965,6 @@ export class DatabaseService {
                 } finally {
                     transactionOpen = false;
                 }
-            }
-            if (restoreSnapshot && !databaseStateBeforeDelete) {
-                ({ databaseState: databaseStateBeforeDelete, fileState: fileStateBeforeDelete } = this.capturePersistenceSnapshot());
             }
             if (restoreSnapshot && databaseStateBeforeDelete) {
                 try {

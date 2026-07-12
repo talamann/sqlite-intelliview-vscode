@@ -372,6 +372,40 @@ suite('Stable cell editing', () => {
         assert.deepStrictEqual(readRows('SELECT id, value FROM records'), [{ id: 1, value: 'original' }]);
     });
 
+    test('preserves earlier in-memory query changes when later persistence fails', async () => {
+        createDatabase(`
+            CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT);
+            INSERT INTO records VALUES (1, 'disk-one'), (2, 'disk-two'), (3, 'disk-three');
+        `);
+        await service.openDatabase(databasePath);
+        await service.executeQuery("UPDATE records SET value = 'query-change' WHERE id = 1");
+        const data = await service.getTableData('records');
+        (service as any).saveChangesToFile = async () => {
+            throw new Error('forced persistence failure');
+        };
+
+        await assert.rejects(
+            service.updateCellData('records', identityFor(data, 'id', 2), 'value', 'must-not-stick'),
+            /forced persistence failure/
+        );
+        await assert.rejects(
+            service.deleteRow('records', { column: 'id', value: 3 }),
+            /forced persistence failure/
+        );
+
+        const afterFailures = await service.getTableData('records');
+        assert.deepStrictEqual(afterFailures.values, [
+            [1, 'query-change'],
+            [2, 'disk-two'],
+            [3, 'disk-three']
+        ]);
+        assert.deepStrictEqual(readRows('SELECT id, value FROM records ORDER BY id'), [
+            { id: 1, value: 'disk-one' },
+            { id: 2, value: 'disk-two' },
+            { id: 3, value: 'disk-three' }
+        ]);
+    });
+
     test('serializes persistence for concurrent updates and deletes', async () => {
         createDatabase(`
             CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT);
