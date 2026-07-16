@@ -2458,6 +2458,10 @@ function initializeTableEvents(tableWrapper) {
         if (typeof filterTable !== "undefined") {
           filterTable(tableWrapper, searchTerm);
         }
+        // Clear multi-row selection when search changes
+        if (typeof clearSelection === "function") {
+          clearSelection(tableWrapper);
+        }
         const tableKey = tableWrapper.getAttribute("data-table");
         if (tableKey && typeof window.setTabViewState === "function") {
           window.setTabViewState(
@@ -2668,14 +2672,142 @@ function initializeTableEvents(tableWrapper) {
         }
       });
     }
-    // Export button
+    // Export button (all visible)
     const exportBtn = tableWrapper.querySelector('[data-action="export"]');
     if (exportBtn) {
       exportBtn.addEventListener("click", (e) => {
         e.preventDefault();
-        const tableWrapper = e.target.closest(".enhanced-table-wrapper");
+        const wrapper = e.target.closest(".enhanced-table-wrapper");
         if (typeof exportTableData !== "undefined") {
-          exportTableData(tableWrapper);
+          exportTableData(wrapper, { onlySelected: false });
+        }
+      });
+    }
+
+    // Export selected button
+    const exportSelectedBtn = tableWrapper.querySelector(
+      '[data-action="export-selected"]'
+    );
+    if (exportSelectedBtn) {
+      exportSelectedBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        const wrapper = e.target.closest(".enhanced-table-wrapper");
+        if (typeof exportTableData !== "undefined") {
+          exportTableData(wrapper, { onlySelected: true });
+        }
+      });
+    }
+
+    // Delete selected button
+    const deleteSelectedBtn = tableWrapper.querySelector(
+      '[data-action="delete-selected"]'
+    );
+    if (deleteSelectedBtn) {
+      deleteSelectedBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        const wrapper = e.target.closest(".enhanced-table-wrapper");
+        if (typeof deleteSelectedRows !== "undefined") {
+          deleteSelectedRows(wrapper);
+        }
+      });
+    }
+
+    // Multi-row selection via row click or checkbox
+    if (tableWrapper.getAttribute("data-selection-delegated") !== "true") {
+      tableWrapper.setAttribute("data-selection-delegated", "true");
+
+      tableWrapper.addEventListener("click", (e) => {
+        const target = e.target instanceof Element ? e.target : null;
+        if (!target) return;
+
+        // Ignore clicks on interactive elements (but NOT checkboxes — handle those via change event)
+        if (
+          target.closest(
+            "button, select, textarea, a, .resize-handle, .cell-editing-controls, th, .sortable-header, .pagination-btn, .page-input, .page-size-select"
+          )
+        ) {
+          return;
+        }
+
+        const row = target.closest("tr.resizable-row");
+        if (!row) return;
+
+        const globalIndex = parseInt(
+          row.getAttribute("data-row-index") || "",
+          10
+        );
+        if (!Number.isFinite(globalIndex)) return;
+
+        const wrapper = row.closest(".enhanced-table-wrapper");
+        if (!wrapper) return;
+
+        if (typeof toggleRowSelection === "function") {
+          toggleRowSelection(wrapper, globalIndex);
+        }
+      });
+
+      // Individual checkbox toggle
+      tableWrapper.addEventListener("change", (e) => {
+        const target = e.target instanceof Element ? e.target : null;
+        if (!target) return;
+
+        const cb = target.closest(".row-select-checkbox");
+        if (!cb) return;
+
+        const globalIndex = parseInt(
+          cb.getAttribute("data-global-index") || "",
+          10
+        );
+        if (!Number.isFinite(globalIndex)) return;
+
+        const wrapper = cb.closest(".enhanced-table-wrapper");
+        if (!wrapper) return;
+
+        // Sync the selection store with the checkbox state
+        const sel = typeof getSelectionStore === "function" ? getSelectionStore(wrapper) : null;
+        if (!sel) return;
+
+        if (cb.checked) {
+          sel.add(globalIndex);
+        } else {
+          sel.delete(globalIndex);
+        }
+        if (typeof updateSelectedUI === "function") {
+          updateSelectedUI(wrapper);
+        }
+      });
+
+      // Select-all checkbox
+      tableWrapper.addEventListener("change", (e) => {
+        const target = e.target instanceof Element ? e.target : null;
+        if (!target) return;
+
+        const cb = target.closest(".select-all-checkbox");
+        if (!cb) return;
+
+        const wrapper = cb.closest(".enhanced-table-wrapper");
+        if (!wrapper) return;
+
+        const table = wrapper.querySelector(".data-table");
+        if (!table) return;
+
+        const sel = typeof getSelectionStore === "function" ? getSelectionStore(wrapper) : null;
+        if (!sel) return;
+
+        const visibleRows = table.querySelectorAll("tr.resizable-row");
+        if (cb.checked) {
+          visibleRows.forEach((row) => {
+            const idx = parseInt(row.getAttribute("data-row-index") || "", 10);
+            if (Number.isFinite(idx)) sel.add(idx);
+          });
+        } else {
+          visibleRows.forEach((row) => {
+            const idx = parseInt(row.getAttribute("data-row-index") || "", 10);
+            if (Number.isFinite(idx)) sel.delete(idx);
+          });
+        }
+        if (typeof updateSelectedUI === "function") {
+          updateSelectedUI(wrapper);
         }
       });
     }
@@ -3152,6 +3284,47 @@ function handleCellUpdateError(message) {
 function handleDeleteRowSuccess(message) {
   const { tableName, rowId } = message;
 
+  // Batch delete handler: refresh table and clear selection
+  if (Array.isArray(rowId) && rowId.length > 1) {
+    if (typeof showDeleteSuccess === "function") showDeleteSuccess();
+    // Clear any stale selection state
+    const wrapper = document.querySelector(
+      `.enhanced-table-wrapper[data-table="${tableName}"]`,
+    );
+    if (wrapper && typeof clearSelection === "function") {
+      clearSelection(wrapper);
+    }
+    // Trigger a data refresh for the current page
+    const state =
+      typeof getCurrentState === "function" ? getCurrentState() : {};
+    const vs =
+      wrapper &&
+      /** @type {any} */ (wrapper).__virtualTableState;
+    const page = vs ? parseInt(wrapper.getAttribute("data-current-page") || "1", 10) : 1;
+    const pageSize = vs ? parseInt(wrapper.getAttribute("data-page-size") || "100", 10) : 100;
+    if (
+      tableName &&
+      window.vscode &&
+      typeof window.vscode.postMessage === "function"
+    ) {
+      window.vscode.postMessage({
+        type: "getTableData",
+        tableName: tableName,
+        key: (state && state.encryptionKey) || "",
+        page,
+        pageSize,
+      });
+    }
+    if (window.debug) {
+      window.debug.debug(
+        `[Events] Batch delete successful for ${tableName}: ${rowId.length} rows`,
+      );
+    }
+    // Skip single-row handler for batches
+    return;
+  }
+
+  // Single-row delete: delegate to context-menu.js handler
   if (
     typeof window !== "undefined" &&
     typeof (/** @type {any} */ (window).handleDeleteSuccess) === "function"
@@ -3706,10 +3879,12 @@ function handleTableDataDelta({
           }
         });
       }
-      // Patch each cell in the new row
+      // Patch each cell in the new row (skip checkbox cell, use data-column attribute)
       if (newRow) {
-        Array.from(newRow.children).forEach((cell, idx) => {
-          const colName = columns[idx];
+        newRow.querySelectorAll("td[data-column]").forEach((cell) => {
+          const colIdx = parseInt(cell.getAttribute("data-column") || "", 10);
+          if (!Number.isFinite(colIdx) || colIdx < 0) return;
+          const colName = columns[colIdx];
           // Always set data-column-name for robust context menu detection
           if (colName) {
             cell.setAttribute("data-column-name", colName);
